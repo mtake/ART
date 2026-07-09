@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -8,8 +9,16 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+import art
 from art.megatron.service import MegatronService
-from art.unsloth.service import UnslothService
+
+
+@pytest.fixture(autouse=True)
+def _init_megatron_runtime_config() -> None:
+    art.init_megatron_runtime_config(
+        topology=art.MegatronTopologyConfig(tp=1, cp=2, ep=2, etp=1),
+        packed_sequence_length=1024,
+    )
 
 
 class _AsyncOkResponse:
@@ -48,6 +57,27 @@ class _FakeAsyncioProcess:
         return 0
 
 
+def test_megatron_default_lora_adapter_config_uses_model_lora_config(
+    tmp_path: Path,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "lora_config": {
+                "rank": 8,
+                "target_modules": ["q_proj", "down_proj"],
+            },
+        },
+        output_dir=str(tmp_path),
+    )
+
+    config = service._default_lora_adapter_config()
+
+    assert config.r == 8
+    assert config.target_modules == {"q_proj", "down_proj"}
+
+
 @pytest.mark.asyncio
 async def test_megatron_shared_start_requires_runtime_sleep_mode(
     tmp_path: Path,
@@ -77,7 +107,8 @@ async def test_unsloth_shared_start_requires_runtime_sleep_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = UnslothService(
+    unsloth_service = pytest.importorskip("art.unsloth.service")
+    service = unsloth_service.UnslothService(
         model_name="test-model",
         base_model="Qwen/Qwen3-0.6B",
         config={
@@ -133,7 +164,8 @@ async def test_unsloth_runtime_sleep_and_wake_use_runtime_routes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = UnslothService(
+    unsloth_service = pytest.importorskip("art.unsloth.service")
+    service = unsloth_service.UnslothService(
         model_name="test-model",
         base_model="Qwen/Qwen3-0.6B",
         config={"rollout_weights_mode": "lora"},
@@ -178,7 +210,40 @@ async def test_megatron_dedicated_merged_start_syncs_initial_weights(
 
     assert location == ("127.0.0.1", 8000)
     start_vllm.assert_awaited_once()
-    sync_merged.assert_awaited_once_with(lora_path="/tmp/lora", step=0)
+    sync_merged.assert_awaited_once_with(
+        lora_path="/tmp/lora",
+        step=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_megatron_dedicated_merged_start_uses_configured_topology(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "trainer_gpu_ids": [0],
+            "inference_gpu_ids": [1],
+            "rollout_weights_mode": "merged",
+        },
+        output_dir=str(tmp_path),
+    )
+    start_vllm = AsyncMock(return_value=("127.0.0.1", 8000))
+    sync_merged = AsyncMock()
+    monkeypatch.setattr(service, "_resolve_active_lora_path", lambda: "/tmp/lora")
+    monkeypatch.setattr(service, "_start_vllm_subprocess", start_vllm)
+    monkeypatch.setattr(service, "_sync_dedicated_merged_weights", sync_merged)
+
+    await service.start_openai_server(None)
+
+    sync_merged.assert_awaited_once_with(
+        lora_path="/tmp/lora",
+        step=0,
+    )
+    assert service.runtime_config.topology.cp == 2
 
 
 @pytest.mark.asyncio
@@ -194,6 +259,10 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
             "trainer_gpu_ids": [0],
             "inference_gpu_ids": [1],
             "rollout_weights_mode": "lora",
+            "lora_config": {
+                "rank": 8,
+                "target_modules": ["q_proj", "down_proj"],
+            },
         },
         output_dir=str(tmp_path),
     )
@@ -235,5 +304,11 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
     ]
     assert "uv run" not in command
     assert recorded["cwd"] == str(Path(__file__).resolve().parents[4])
+    env = cast(dict[str, str], recorded["env"])
+    assert env["ART_MEGATRON_LORA_RANK"] == "8"
+    assert json.loads(env["ART_MEGATRON_LORA_TARGET_MODULES"]) == [
+        "q_proj",
+        "down_proj",
+    ]
     service._child_processes.close()
     service._megatron_log_file.close()

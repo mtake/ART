@@ -14,6 +14,7 @@ from art.preprocessing.tokenize import (
     _messages_for_chat_template,
     tokenize_trajectory,
     tokenize_trajectory_groups,
+    tokenize_vllm_trajectory_histories,
 )
 from art.trajectories import History
 from tests.support.chat_template_conformance_cases import (
@@ -96,21 +97,24 @@ class ChatTemplateRolloutReport(BaseModel):
 def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
     output_dir = _artifact_dir(base_model)
     backend = LocalBackend(path=str(output_dir))
-    internal_config = art.dev.InternalModelConfig(
-        {"init_args": {"max_seq_length": 2048}}
-    )
     model = art.TrainableModel(
         name="model-support-chat-template",
         project="model-support-validation",
         base_model=base_model,
-        _internal_config=internal_config,
+        _internal_config={"init_args": {"max_seq_length": 2048}},
     )
+    internal_config = model._internal_config
+    assert internal_config is not None
     tokenizer_key = _tokenizer_cache_key(base_model, internal_config)
     tokenizer = backend._tokenizers.get(tokenizer_key)
     if tokenizer is None:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
+        tokenizer = backend._configure_training_tokenizer(
+            AutoTokenizer.from_pretrained(base_model),
+            model=model,
+            internal_config=internal_config,
+        )
         backend._tokenizers[tokenizer_key] = tokenizer
 
     inputs = build_chat_template_conformance_inputs(tokenizer)
@@ -128,27 +132,31 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
         )
     )
 
-    non_final_tool_call_base = tokenize_trajectory(
+    non_final_tool_call_base_results = tokenize_vllm_trajectory_histories(
         tokenizer=tokenizer,
-        image_processor=None,
-        history=_history(inputs.non_final_tool_call_base),
+        histories=[_history(inputs.non_final_tool_call_base)],
         advantage=1.0,
         allow_training_without_logprobs=False,
         trajectory=inputs.non_final_tool_call_base,
     )
-    non_final_tool_call_mutated = tokenize_trajectory(
+    non_final_tool_call_mutated_results = tokenize_vllm_trajectory_histories(
         tokenizer=tokenizer,
-        image_processor=None,
-        history=_history(inputs.non_final_tool_call_mutated),
+        histories=[_history(inputs.non_final_tool_call_mutated)],
         advantage=1.0,
         allow_training_without_logprobs=False,
         trajectory=inputs.non_final_tool_call_mutated,
     )
-    if non_final_tool_call_base is None or non_final_tool_call_mutated is None:
+    if not non_final_tool_call_base_results or not non_final_tool_call_mutated_results:
         raise RuntimeError("tool-call tokenization produced no trainable tokens")
+    non_final_tool_call_base = non_final_tool_call_base_results[-1]
+    non_final_tool_call_mutated = non_final_tool_call_mutated_results[-1]
     if (
-        len(non_final_tool_call_base.choice_offsets) < 2
-        or len(non_final_tool_call_mutated.choice_offsets) < 2
+        sum(len(result.choice_offsets) for result in non_final_tool_call_base_results)
+        < 2
+        or sum(
+            len(result.choice_offsets) for result in non_final_tool_call_mutated_results
+        )
+        < 2
     ):
         raise RuntimeError("expected non-final tool call and final assistant answer")
     non_final_tool_call_prefix_changed = _assistant_prefix_tokens(
@@ -161,10 +169,17 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
     scenarios.append(
         ChatTemplateScenarioReport(
             name="rl_non_final_tool_call_prefill_mutation",
-            entrypoint="tokenize_trajectory",
+            entrypoint="tokenize_vllm_trajectory_histories",
             passed=non_final_tool_call_prefix_changed
-            and int(sum(non_final_tool_call_base.assistant_mask)) > 0,
-            assistant_token_count=int(sum(non_final_tool_call_base.assistant_mask)),
+            and sum(
+                int(sum(result.assistant_mask))
+                for result in non_final_tool_call_base_results
+            )
+            > 0,
+            assistant_token_count=sum(
+                int(sum(result.assistant_mask))
+                for result in non_final_tool_call_base_results
+            ),
             mutation_changed_prompt=non_final_tool_call_prefix_changed,
         )
     )
@@ -250,26 +265,25 @@ def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
         )
     )
 
-    expected_error = "Assistant message has tool_calls"
-    observed_error: str | None = None
-    try:
-        tokenize_trajectory(
-            tokenizer=tokenizer,
-            image_processor=None,
-            history=_history(inputs.unsupported_assistant_tool_calls),
-            advantage=1.0,
-            allow_training_without_logprobs=True,
-            trajectory=inputs.unsupported_assistant_tool_calls,
-        )
-    except ValueError as exc:
-        observed_error = str(exc)
+    unsupported_result = tokenize_trajectory(
+        tokenizer=tokenizer,
+        image_processor=None,
+        history=_history(inputs.unsupported_assistant_tool_calls),
+        advantage=1.0,
+        allow_training_without_logprobs=True,
+        trajectory=inputs.unsupported_assistant_tool_calls,
+    )
     scenarios.append(
         ChatTemplateScenarioReport(
-            name="unsupported_assistant_tool_calls_without_logprobs",
+            name="rl_dict_assistant_tool_calls_without_choice_is_not_trainable",
             entrypoint="tokenize_trajectory",
-            passed=observed_error is not None and expected_error in observed_error,
-            expected_error_substring=expected_error,
-            observed_error=observed_error,
+            passed=unsupported_result is None,
+            result_count=int(unsupported_result is not None),
+            assistant_token_count=(
+                0
+                if unsupported_result is None
+                else int(sum(unsupported_result.assistant_mask))
+            ),
         )
     )
 

@@ -8,6 +8,7 @@ torch = pytest.importorskip("torch")
 
 from . import workflow_stage
 from .output_parity import (
+    TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
     TOP_K,
     EngineSide,
     ScoreBundle,
@@ -19,10 +20,18 @@ from .output_parity import (
     compare_rollout,
     compare_topk,
     config_from_env,
+    fwd_mean_abs_pct_limit_for_model,
+    top20_kl_candidate_to_target_limit_for_model,
+)
+from .real_path import (
+    RealPathConfig,
+    _delete_adapter_safetensors_on_pass,
+    _real_path_rollout_mode,
+    _real_path_rollout_weights_mode,
 )
 
 
-def test_logical_map_flattens_shared_prefix_branches() -> None:
+def test_logical_map_flattens_prefix_tree_branches() -> None:
     packed = {
         "tokens": torch.tensor([[10, 11, 12, 13, 14, 12, 15, 16]]),
         "group_ids": torch.tensor([[0, 0, 1, 1, 1, 2, 2, 2]]),
@@ -35,11 +44,71 @@ def test_logical_map_flattens_shared_prefix_branches() -> None:
         [10, 11, 12, 13, 14],
         [10, 11, 12, 15, 16],
     ]
+    assert [prompt.packed_prompt_length for prompt in logical_map.prompts] == [2, 2]
+    assert [prompt.scored_token_start_index for prompt in logical_map.prompts] == [
+        3,
+        3,
+    ]
     assert [token.token_id for token in logical_map.tokens] == [13, 14, 15, 16]
     assert [token.art_logit_index for token in logical_map.tokens] == [2, 3, 5, 6]
     assert [token.vllm_prompt_token_index for token in logical_map.tokens] == [
         3,
         4,
+        3,
+        4,
+    ]
+
+
+def test_logical_map_flattens_nested_prefix_tree_leaves() -> None:
+    packed = {
+        "tokens": torch.tensor(
+            [[10, 11, 20, 30, 31, 32, 33, 34, 35, 40, 50, 51, 52, 60, 61, 62]]
+        ),
+        "group_ids": torch.tensor([[0, 0, 1, 2, 2, 2, 3, 3, 3, 4, 5, 5, 5, 6, 6, 6]]),
+        "parent_ids": torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 4, 4, 4, 0, 0, 0]]),
+    }
+
+    logical_map = build_logical_token_map(packed)
+
+    assert [prompt.token_ids for prompt in logical_map.prompts] == [
+        [10, 11, 20, 30, 31, 32],
+        [10, 11, 20, 33, 34, 35],
+        [10, 11, 40, 50, 51, 52],
+        [10, 11, 60, 61, 62],
+    ]
+    assert [prompt.packed_prompt_length for prompt in logical_map.prompts] == [
+        3,
+        3,
+        3,
+        2,
+    ]
+    assert [token.token_id for token in logical_map.tokens] == [
+        31,
+        32,
+        34,
+        35,
+        51,
+        52,
+        61,
+        62,
+    ]
+    assert [token.art_logit_index for token in logical_map.tokens] == [
+        3,
+        4,
+        6,
+        7,
+        10,
+        11,
+        13,
+        14,
+    ]
+    assert [token.vllm_prompt_token_index for token in logical_map.tokens] == [
+        4,
+        5,
+        4,
+        5,
+        4,
+        5,
         3,
         4,
     ]
@@ -119,6 +188,86 @@ def test_compare_rollout_reports_base_lora_and_delta_separately() -> None:
     assert report.delta.mean_abs_pct > 0
 
 
+def test_real_path_default_generates_16_tokens_per_rollout() -> None:
+    assert RealPathConfig().max_completion_tokens == 16
+
+
+def test_real_path_rollout_mode_follows_config() -> None:
+    native_config = TrainInfOutputParityConfig(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+    )
+    merged_config = TrainInfOutputParityConfig(
+        base_model="unvalidated/native-disabled",
+        allow_unvalidated_arch=True,
+    )
+
+    assert _real_path_rollout_mode(native_config) == "native_lora"
+    assert _real_path_rollout_weights_mode(native_config) == "lora"
+    assert _real_path_rollout_mode(merged_config) == "merged"
+    assert _real_path_rollout_weights_mode(merged_config) == "merged"
+
+
+def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
+    run_dir = tmp_path / "run"
+    active_lora = run_dir / "real_path_active_lora"
+    checkpoint = run_dir / "art_path" / "models" / "m" / "checkpoints" / "0000"
+    active_lora.mkdir(parents=True)
+    checkpoint.mkdir(parents=True)
+    for directory in (active_lora, checkpoint):
+        (directory / "adapter_model.safetensors").write_bytes(b"adapter")
+        (directory / "adapter_config.json").write_text("{}", encoding="utf-8")
+    score_path = run_dir / "real_path_vllm_lora_scores.json"
+    score_path.write_text("{}", encoding="utf-8")
+
+    _delete_adapter_safetensors_on_pass(run_dir, passed=False)
+
+    assert len(list(run_dir.rglob("adapter_model.safetensors"))) == 2
+
+    _delete_adapter_safetensors_on_pass(run_dir, passed=True)
+
+    assert list(run_dir.rglob("adapter_model.safetensors")) == []
+    assert len(list(run_dir.rglob("adapter_config.json"))) == 2
+    assert score_path.exists()
+
+
+def test_architecture_specific_real_path_limits() -> None:
+    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3-30B-A3B") == 7.0
+    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-35B-A3B") == 5.0
+    assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
+
+
+def test_gemma4_real_path_limits() -> None:
+    assert (
+        fwd_mean_abs_pct_limit_for_model(
+            "google/gemma-4-31B-it",
+            allow_unvalidated_arch=True,
+        )
+        == 8.0
+    )
+    assert (
+        top20_kl_candidate_to_target_limit_for_model(
+            "google/gemma-4-31B-it",
+            allow_unvalidated_arch=True,
+        )
+        == 0.003
+    )
+    assert (
+        fwd_mean_abs_pct_limit_for_model(
+            "google/gemma-4-26B-A4B-it",
+            allow_unvalidated_arch=True,
+        )
+        == 8.0
+    )
+    assert (
+        top20_kl_candidate_to_target_limit_for_model(
+            "google/gemma-4-26B-A4B-it",
+            allow_unvalidated_arch=True,
+        )
+        == 0.008
+    )
+    assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
+
+
 def test_compare_topk_reports_restricted_intersection_kl() -> None:
     target = ScoreBundle(
         side="megatron",
@@ -166,6 +315,26 @@ def test_config_from_env_accepts_lora_target_module_override(
     assert config.lora_target_modules == ["experts", "in_proj_qkv", "in_proj_z"]
 
 
+def test_config_from_env_accepts_vllm_memory_utilization_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION", "0.5")
+
+    config = config_from_env()
+
+    assert config.engine_args["gpu_memory_utilization"] == 0.5
+
+
+def test_config_from_env_accepts_gdn_prefill_backend_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_GDN_PREFILL_BACKEND", "triton")
+
+    config = config_from_env()
+
+    assert config.engine_args["additional_config"] == {"gdn_prefill_backend": "triton"}
+
+
 def test_default_rollout_modes_follow_model_support_native_lora_status() -> None:
     assert TrainInfOutputParityConfig(
         base_model="Qwen/Qwen3.5-35B-A3B"
@@ -198,8 +367,11 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
     import subprocess
 
     captured_env = {}
+    real_run = workflow_stage.subprocess.run
 
     def fake_run(*args, **kwargs):
+        if "env" not in kwargs:
+            return real_run(*args, **kwargs)
         captured_env.update(kwargs["env"])
         return subprocess.CompletedProcess(
             args=args,
@@ -211,7 +383,13 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
     monkeypatch.setattr(workflow_stage, "create_artifact_dir", lambda _nodeid: tmp_path)
     monkeypatch.setattr(workflow_stage.subprocess, "run", fake_run)
 
-    report = workflow_stage.run_train_inf_mismatch(base_model="Qwen/Qwen3.5-35B-A3B")
+    report = workflow_stage.run_train_inf_mismatch(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        allow_unvalidated_arch=True,
+    )
 
     assert report.passed is True
     assert captured_env["ART_RUN_TRAIN_INF_MISMATCH_LIVE"] == "1"
+    assert captured_env["ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH"] == "1"
+    assert captured_env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] == "16"
+    assert captured_env["ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION"] == "0.50"

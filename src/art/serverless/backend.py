@@ -1,7 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 import time
-from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
 from openai._types import NOT_GIVEN
@@ -22,16 +22,22 @@ from ..metrics_taxonomy import (
     summarize_trajectory_groups,
 )
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
+from ..types import (
+    ServerlessTrainResult,
+    SFTMetricLoggingConfig,
+    TrainConfig,
+    TrainSFTConfig,
+)
+from ..utils import wandb_sdk
 from ..utils.record_provenance import record_provenance
 
 if TYPE_CHECKING:
-    import wandb
+    from wandb.sdk.artifacts.artifact import Artifact
 
     from ..model import Model, TrainableModel
 
 
-def _extract_step_from_wandb_artifact(artifact: "wandb.Artifact") -> int | None:
+def _extract_step_from_wandb_artifact(artifact: "Artifact") -> int | None:
     """Extract step number from a W&B artifact's aliases."""
     for alias in artifact.aliases:
         if alias.startswith("step"):
@@ -87,6 +93,9 @@ class ServerlessBackend(Backend):
         client = Client(api_key=api_key, base_url=base_url)
         self._base_url = str(client.base_url)
         self._client = client
+
+    def logs_sft_metrics_remotely(self) -> bool:
+        return True
 
     async def close(self) -> None:
         await self._client.close()  # ty:ignore[possibly-missing-attribute]
@@ -217,6 +226,9 @@ class ServerlessBackend(Backend):
         adam_params: object | None = None,
         # KL-penalized advantage adjustment
         kl_penalty_coef: float = 0.0,
+        kl_penalty_reference_step: int | None = None,
+        kl_penalty_source: Literal["current_learner", "sample"] | None = None,
+        kl_penalty_step_lag: int | None = None,
         kl_ref_adapter_path: str | None = None,
         # RL algorithm settings
         ppo: bool | None = None,
@@ -267,6 +279,15 @@ class ServerlessBackend(Backend):
                 ServerlessBackend.
             kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
                 Defaults to 0.0 (disabled).
+            kl_penalty_reference_step: Checkpoint step of the training model to
+                use as the KL reference. When omitted, the backend may use
+                kl_ref_adapter_path or its default reference policy.
+            kl_penalty_source: Which policy's logprobs to compare against the
+                reference policy. When omitted, defaults to "sample" if KL is
+                enabled and "current_learner" otherwise.
+            kl_penalty_step_lag: Moving KL reference lag. The serverless
+                backend resolves this as max(0, current_step - lag). Mutually
+                exclusive with kl_penalty_reference_step.
             kl_ref_adapter_path: Direct filesystem path to a LoRA adapter
                 checkpoint to use as the KL reference.
             ppo: Legacy flag for PPO clipping. Prefer loss_fn="ppo".
@@ -327,6 +348,21 @@ class ServerlessBackend(Backend):
             scale_rewards = False
         if adam_params is not None:
             raise ValueError("ServerlessBackend requires adam_params=None.")
+        if kl_penalty_reference_step is not None and kl_penalty_reference_step < 0:
+            raise ValueError("kl_penalty_reference_step must be >= 0.")
+        if kl_penalty_step_lag is not None:
+            if kl_penalty_step_lag < 1:
+                raise ValueError("kl_penalty_step_lag must be >= 1.")
+            if kl_penalty_reference_step is not None:
+                raise ValueError(
+                    "Only one of kl_penalty_reference_step and "
+                    "kl_penalty_step_lag may be set."
+                )
+        resolved_kl_penalty_source: Literal["current_learner", "sample"] = (
+            kl_penalty_source
+            if kl_penalty_source is not None
+            else ("sample" if kl_penalty_coef > 0.0 else "current_learner")
+        )
         _ = save_checkpoint
 
         config, dev_config = build_rl_train_configs(
@@ -342,6 +378,7 @@ class ServerlessBackend(Backend):
             max_negative_advantage_importance_sampling_weight=max_negative_advantage_importance_sampling_weight,
             kimi_k2_tau=kimi_k2_tau,
             kl_penalty_coef=kl_penalty_coef,
+            kl_penalty_source=resolved_kl_penalty_source,
             allow_training_without_logprobs=allow_training_without_logprobs,
             plot_tensors=plot_tensors,
             truncated_importance_sampling=truncated_importance_sampling,
@@ -351,6 +388,10 @@ class ServerlessBackend(Backend):
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=kl_ref_adapter_path,
         )
+        if kl_penalty_reference_step is not None:
+            dev_config["kl_penalty_reference_step"] = kl_penalty_reference_step
+        if kl_penalty_step_lag is not None:
+            dev_config["kl_penalty_step_lag"] = kl_penalty_step_lag
 
         # Collect metrics from training
         training_metrics: list[dict[str, float]] = []
@@ -410,6 +451,9 @@ class ServerlessBackend(Backend):
                 importance_sampling_level=dev_config.get("importance_sampling_level"),
                 kimi_k2_tau=dev_config.get("kimi_k2_tau"),
                 kl_penalty_coef=dev_config.get("kl_penalty_coef"),
+                kl_penalty_reference_step=dev_config.get("kl_penalty_reference_step"),
+                kl_penalty_source=dev_config.get("kl_penalty_source"),
+                kl_penalty_step_lag=dev_config.get("kl_penalty_step_lag"),
                 kl_ref_adapter_path=dev_config.get("kl_ref_adapter_path"),
                 learning_rate=config.learning_rate,
                 logprob_calculation_chunk_size=dev_config.get(
@@ -498,15 +542,13 @@ class ServerlessBackend(Backend):
         import tempfile
         import uuid
 
-        import wandb
-
         from ..utils.sft import resolve_sft_batch_size
 
         assert model.id is not None, "Model ID is required"
 
         # Get the user's default entity from W&B if not set
         if model.entity is None:
-            api = wandb.Api(api_key=self._client.api_key)
+            api = wandb_sdk.api(api_key=self._client.api_key)
             model.entity = api.default_entity
 
         # Generate unique artifact name to avoid race conditions in distributed systems
@@ -549,17 +591,17 @@ class ServerlessBackend(Backend):
 
             # Upload the file to W&B as a dataset artifact
             # Use the model's canonical run_id from database, or fall back to model name
-            run = wandb.init(
+            run = wandb_sdk.init(
                 name=model.name,
                 id=model.run_id
                 or model.name,  # Use stored run_id to match the canonical wandb run
                 entity=model.entity,
                 project=model.project,
                 resume="allow",  # Resume if this run already exists
-                settings=wandb.Settings(api_key=self._client.api_key),
+                settings=wandb_sdk.settings(api_key=self._client.api_key),
             )
             try:
-                artifact = wandb.Artifact(
+                artifact = wandb_sdk.artifact(
                     artifact_name,
                     type="dataset",
                     metadata={
@@ -607,6 +649,12 @@ class ServerlessBackend(Backend):
             )
             sft_config["batch_size"] = batch_size
         sft_config["learning_rate"] = config.learning_rate
+        metric_logging = cast(
+            SFTMetricLoggingConfig,
+            dict(dev_config.get("metric_logging", {}) or {}),
+        )
+        if metric_logging.get("enabled"):
+            sft_config["metric_logging"] = metric_logging
 
         sft_training_job = await self._client.sft_training_jobs.create(
             model_id=model.id,
@@ -686,12 +734,10 @@ class ServerlessBackend(Backend):
         import os
         import tempfile
 
-        import wandb
-
         assert model.id is not None, "Model ID is required"
 
         # If entity is not set, use the user's default entity from W&B
-        api = wandb.Api(api_key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
+        api = wandb_sdk.api(api_key=self._client.api_key)
         if model.entity is None:
             model.entity = api.default_entity
             if verbose:
@@ -856,8 +902,6 @@ class ServerlessBackend(Backend):
         import os
         import tempfile
 
-        import wandb
-
         from_project = from_project or model.project
 
         if from_s3_bucket is not None:
@@ -913,7 +957,7 @@ class ServerlessBackend(Backend):
             selected_step = target_step
         else:
             # Pull from W&B artifacts
-            api = wandb.Api(api_key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
+            api = wandb_sdk.api(api_key=self._client.api_key)
             from_entity = model.entity or api.default_entity
 
             # Iterate all artifact versions to find the best step.
@@ -963,17 +1007,17 @@ class ServerlessBackend(Backend):
         if verbose:
             print(f"Uploading forked checkpoint as W&B artifact for {model.name}...")
 
-        wandb.login(key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
-        run = wandb.init(
+        wandb_sdk.login(key=self._client.api_key)
+        run = wandb_sdk.init(
             project=model.project,
             entity=model.entity,
             job_type="checkpoint-fork",
             name=f"fork-{from_model}-to-{model.name}",
-            settings=wandb.Settings(silent=True),
+            settings=wandb_sdk.settings(silent=True),
         )
         assert run is not None
 
-        dest_artifact = wandb.Artifact(name=model.name, type="lora")
+        dest_artifact = wandb_sdk.artifact(name=model.name, type="lora")
         dest_artifact.add_dir(checkpoint_dir)
         aliases = ["latest"]
         if selected_step is not None:
@@ -982,7 +1026,7 @@ class ServerlessBackend(Backend):
         run.finish()
 
         # Copy provenance from the source model's W&B run to the destination model
-        api = wandb.Api(api_key=self._client.api_key)  # ty:ignore[possibly-missing-attribute]
+        api = wandb_sdk.api(api_key=self._client.api_key)
         try:
             source_run = api.run(f"{model.entity}/{from_project}/{from_model}")
             source_provenance = source_run.config.get("wandb.provenance")

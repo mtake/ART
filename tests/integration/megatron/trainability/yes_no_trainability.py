@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 import gc
-from itertools import permutations
 import os
 from pathlib import Path
 import re
@@ -17,29 +16,38 @@ import torch
 import art
 from art import dev
 from art.local import LocalBackend
+from art.megatron.backend import MegatronBackend
 from art.megatron.model_support.registry import (
     get_model_support_spec,
+    model_supports_context_parallel,
     model_uses_expert_parallel,
 )
 from art.megatron.model_support.spec import RolloutWeightsMode
-from art.megatron.runtime.backend import MegatronBackend
 
 from ..model_support.oracle_harness import Topology, oracle_topology
 from ..model_support.oracle_worker import provider_topology_env
+from ..model_support.workflow_resources import (
+    handler_workflow_resources_for_base_model,
+    resolve_stage_resources_for_current_host,
+)
 
 _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 _INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
 _SHARED_GPU_IDS_ENV = "ART_MODEL_SUPPORT_SHARED_GPU_IDS"
+_VARIANT_ENV = "ART_MODEL_SUPPORT_YES_NO_VARIANT"
+_EXTERNAL_VLLM_URL_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL"
+_EXTERNAL_VLLM_API_KEY_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY"
 _TRAINABILITY_ROOT = (
     Path(__file__).resolve().parents[4] / ".local" / "model_support_validation"
 )
-_SHARED_MEGATRON_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
-_DENSE_SHARED_MEGATRON_TOPOLOGY = Topology(tp=2, ep=1, etp=1, dp=1, sp=True)
+_SHARED_MEGATRON_TOPOLOGY = Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False)
+_DENSE_SHARED_MEGATRON_TOPOLOGY = Topology(tp=1, ep=1, etp=1, dp=1, cp=2, sp=False)
 _VARIANT_NAME = Literal[
     "megatron_shared",
     "megatron_dedicated",
     "unsloth_dedicated",
 ]
+_RESOURCE_STAGE_NAME = Literal["yes_no_trainability", "length_trainability"]
 
 
 class _TrainKwargs(TypedDict):
@@ -67,6 +75,8 @@ class YesNoTrainabilityReport(BaseModel):
     prompt_count: int
     eval_prompt_count: int
     rollouts_per_prompt: int
+    prompt_tree_depth: int = 0
+    prompt_tree_branch_count: int = 0
     latest_step: int
     initial_eval_reward: float
     final_eval_reward: float | None = None
@@ -88,26 +98,52 @@ class _TrainabilityVariant(BaseModel):
     inference_gpu_ids: list[int] = Field(default_factory=list)
 
 
+_YES_NO_PROMPT_ROOT = (
+    "Read the validation card and answer with one word from yes, no, or maybe."
+)
+_YES_NO_PROMPT_MIDS = (
+    "Branch alpha: the card is about deployment readiness.",
+    "Branch beta: the card is about metric interpretation.",
+)
+_YES_NO_PROMPT_LEAVES = (
+    "Case one: the safest answer is uncertain.",
+    "Case two: the report contains a contradiction.",
+    "Case three: the check has partial evidence.",
+    "Case four: the reviewer needs a cautious final word.",
+)
+
+
 def build_prompts() -> list[str]:
     prompt = os.environ.get("ART_MODEL_SUPPORT_YES_NO_PROMPT", "").strip()
     prompt_count = _get_env_int("ART_MODEL_SUPPORT_YES_NO_PROMPT_COUNT", 8)
     if prompt:
         return [prompt] * max(1, prompt_count)
     prompts = [
-        f"{prefix} exactly one of {body}"
-        for prefix in ("respond with", "just respond with")
-        for use_quotes in (True, False)
-        for length in (3, 2)
-        for words in permutations(("yes", "no", "maybe"), length)
-        for body in [
-            ", ".join(f"'{word}'" if use_quotes else word for word in words)
-            if length == 3
-            else " or ".join(f"'{word}'" if use_quotes else word for word in words)
-        ]
+        "\n\n".join(
+            (
+                _YES_NO_PROMPT_ROOT,
+                _YES_NO_PROMPT_MIDS[(index // 2) % len(_YES_NO_PROMPT_MIDS)],
+                _YES_NO_PROMPT_LEAVES[index % len(_YES_NO_PROMPT_LEAVES)],
+                "Return only yes, no, or maybe.",
+            )
+        )
+        for index in range(max(1, prompt_count))
     ]
-    if prompt_count <= len(prompts):
-        return prompts[: max(1, prompt_count)]
-    return [prompts[index % len(prompts)] for index in range(prompt_count)]
+    return prompts
+
+
+def _prompt_tree_shape(prompts: list[str]) -> tuple[int, int]:
+    mid_count = len(
+        {mid for mid in _YES_NO_PROMPT_MIDS if any(mid in prompt for prompt in prompts)}
+    )
+    leaf_count = len(
+        {
+            leaf
+            for leaf in _YES_NO_PROMPT_LEAVES
+            if any(leaf in prompt for prompt in prompts)
+        }
+    )
+    return (3 if mid_count and leaf_count else 1, mid_count + leaf_count)
 
 
 def _slugify(value: str) -> str:
@@ -119,6 +155,50 @@ def _parse_gpu_id_env(name: str) -> list[int] | None:
     if raw is None or raw.strip() == "":
         return None
     return [int(part.strip()) for part in raw.split(",") if part.strip()]
+
+
+def _external_vllm_runtime_config() -> dev.VllmRuntimeArgs | None:
+    server_url = os.environ.get(_EXTERNAL_VLLM_URL_ENV)
+    if server_url is None or server_url.strip() == "":
+        return None
+    return {
+        "mode": "external",
+        "server_url": server_url,
+        "api_key": os.environ.get(_EXTERNAL_VLLM_API_KEY_ENV, "art-external-vllm"),
+    }
+
+
+def _topology_with_env_overrides(topology: Topology) -> Topology:
+    updates: dict[str, int | bool] = {}
+    for env_name, attr in (
+        ("ART_MODEL_SUPPORT_TP", "tp"),
+        ("ART_MODEL_SUPPORT_EP", "ep"),
+        ("ART_MODEL_SUPPORT_ETP", "etp"),
+        ("ART_MODEL_SUPPORT_DP", "dp"),
+        ("ART_MODEL_SUPPORT_CP", "cp"),
+        ("ART_MODEL_SUPPORT_PP", "pp"),
+        ("ART_MODEL_SUPPORT_VPP", "vpp"),
+    ):
+        if raw_value := os.environ.get(env_name):
+            updates[attr] = int(raw_value)
+    if raw_sp := os.environ.get("ART_MODEL_SUPPORT_SP"):
+        updates["sp"] = raw_sp.strip().lower() in {"1", "true", "yes", "on"}
+    return topology.model_copy(update=updates) if updates else topology
+
+
+def _variant_with_env_overrides(
+    variant: _TrainabilityVariant,
+) -> _TrainabilityVariant:
+    trainer_gpu_ids = _parse_gpu_id_env(_TRAINER_GPU_IDS_ENV)
+    inference_gpu_ids = _parse_gpu_id_env(_INFERENCE_GPU_IDS_ENV)
+    updates: dict[str, object] = {}
+    if trainer_gpu_ids is not None:
+        updates["trainer_gpu_ids"] = trainer_gpu_ids
+    if inference_gpu_ids is not None:
+        updates["inference_gpu_ids"] = inference_gpu_ids
+    if variant.topology is not None:
+        updates["topology"] = _topology_with_env_overrides(variant.topology)
+    return variant.model_copy(update=updates) if updates else variant
 
 
 def _resolve_shared_gpu_ids() -> list[int]:
@@ -286,6 +366,7 @@ def _engine_args_for_yes_no_trainability(
         "max_num_seqs": _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_NUM_SEQS", 4),
         "enforce_eager": True,
         "tensor_parallel_size": tensor_parallel_size,
+        "limit_mm_per_prompt": {"image": 0, "video": 0, "audio": 0},
     }
     if enable_expert_parallel:
         engine_args["enable_expert_parallel"] = True
@@ -309,6 +390,23 @@ def _wandb_disabled() -> Iterator[None]:
                 os.environ[name] = value
 
 
+@contextmanager
+def _temporary_env(updates: dict[str, str] | None) -> Iterator[None]:
+    if not updates:
+        yield
+        return
+    saved = {name: os.environ.get(name) for name in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _artifact_dir(base_model: str, variant_name: _VARIANT_NAME) -> Path:
     path = (
         _TRAINABILITY_ROOT / _slugify(base_model) / variant_name / uuid.uuid4().hex[:8]
@@ -317,44 +415,133 @@ def _artifact_dir(base_model: str, variant_name: _VARIANT_NAME) -> Path:
     return path
 
 
+def _trainability_stage_resources(
+    base_model: str,
+    *,
+    stage_name: _RESOURCE_STAGE_NAME,
+    allow_unvalidated_arch: bool = False,
+):
+    workflow_resources = handler_workflow_resources_for_base_model(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    if workflow_resources is None:
+        return None
+    stage_resources = getattr(workflow_resources, stage_name)
+    if stage_resources is None:
+        return None
+    return resolve_stage_resources_for_current_host(stage_name, stage_resources)
+
+
 def _build_variant(
     variant_name: _VARIANT_NAME,
     *,
     base_model: str,
     allow_unvalidated_arch: bool = False,
+    resource_stage_name: _RESOURCE_STAGE_NAME = "yes_no_trainability",
 ) -> _TrainabilityVariant:
+    stage_resources = _trainability_stage_resources(
+        base_model,
+        stage_name=resource_stage_name,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
     is_moe = model_uses_expert_parallel(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    cp_supported = model_supports_context_parallel(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
     if variant_name == "megatron_shared":
-        shared_gpu_ids = _resolve_shared_gpu_ids()
-        return _TrainabilityVariant(
-            name=variant_name,
-            backend_name="megatron",
-            placement_mode="shared",
-            topology=_SHARED_MEGATRON_TOPOLOGY
-            if is_moe
-            else _DENSE_SHARED_MEGATRON_TOPOLOGY,
-            trainer_gpu_ids=shared_gpu_ids,
-            inference_gpu_ids=shared_gpu_ids,
+        if (
+            stage_resources is not None
+            and stage_resources.megatron is not None
+            and stage_resources.vllm is not None
+        ):
+            shared_gpu_ids = sorted(
+                {*stage_resources.megatron.gpu_ids, *stage_resources.vllm.gpu_ids}
+            )
+        else:
+            shared_gpu_ids = _resolve_shared_gpu_ids()
+        if not cp_supported:
+            shared_world_size = len(shared_gpu_ids)
+            return _variant_with_env_overrides(
+                _TrainabilityVariant(
+                    name=variant_name,
+                    backend_name="megatron",
+                    placement_mode="shared",
+                    topology=Topology(
+                        tp=shared_world_size,
+                        ep=shared_world_size if is_moe else 1,
+                        etp=1,
+                        dp=1,
+                        cp=1,
+                        sp=shared_world_size > 1,
+                    ),
+                    trainer_gpu_ids=shared_gpu_ids,
+                    inference_gpu_ids=shared_gpu_ids,
+                )
+            )
+        return _variant_with_env_overrides(
+            _TrainabilityVariant(
+                name=variant_name,
+                backend_name="megatron",
+                placement_mode="shared",
+                topology=(
+                    _SHARED_MEGATRON_TOPOLOGY
+                    if is_moe
+                    else _DENSE_SHARED_MEGATRON_TOPOLOGY
+                ),
+                trainer_gpu_ids=shared_gpu_ids,
+                inference_gpu_ids=shared_gpu_ids,
+            )
+        )
+    if (
+        variant_name == "megatron_dedicated"
+        and stage_resources is not None
+        and stage_resources.megatron is not None
+        and stage_resources.vllm is not None
+    ):
+        workflow_topology = stage_resources.megatron.topology
+        return _variant_with_env_overrides(
+            _TrainabilityVariant(
+                name=variant_name,
+                backend_name="megatron",
+                placement_mode="dedicated",
+                topology=Topology(
+                    tp=workflow_topology.tp,
+                    ep=workflow_topology.ep,
+                    etp=workflow_topology.etp,
+                    dp=workflow_topology.dp,
+                    sp=workflow_topology.sp,
+                    cp=workflow_topology.cp,
+                    pp=workflow_topology.pp,
+                ),
+                trainer_gpu_ids=list(stage_resources.megatron.gpu_ids),
+                inference_gpu_ids=list(stage_resources.vllm.gpu_ids),
+            )
         )
     trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
     if variant_name == "megatron_dedicated":
-        return _TrainabilityVariant(
+        return _variant_with_env_overrides(
+            _TrainabilityVariant(
+                name=variant_name,
+                backend_name="megatron",
+                placement_mode="dedicated",
+                topology=oracle_topology(is_moe=is_moe),
+                trainer_gpu_ids=trainer_gpu_ids,
+                inference_gpu_ids=inference_gpu_ids,
+            )
+        )
+    return _variant_with_env_overrides(
+        _TrainabilityVariant(
             name=variant_name,
-            backend_name="megatron",
+            backend_name="local",
             placement_mode="dedicated",
-            topology=oracle_topology(is_moe=is_moe),
             trainer_gpu_ids=trainer_gpu_ids,
             inference_gpu_ids=inference_gpu_ids,
         )
-    return _TrainabilityVariant(
-        name=variant_name,
-        backend_name="local",
-        placement_mode="dedicated",
-        trainer_gpu_ids=trainer_gpu_ids,
-        inference_gpu_ids=inference_gpu_ids,
     )
 
 
@@ -368,6 +555,23 @@ def _variant_train_kwargs(variant: _TrainabilityVariant) -> _TrainKwargs:
 
 def _variant_init_args(variant: _TrainabilityVariant) -> dev.InitArgs:
     return {"max_seq_length": _variant_packed_sequence_length(variant)}
+
+
+def _init_megatron_runtime_config(variant: _TrainabilityVariant) -> None:
+    if variant.topology is None:
+        return
+    init_runtime_config = getattr(art, "init_megatron_runtime_config", None)
+    if init_runtime_config is None:
+        return
+    init_runtime_config(
+        topology=art.MegatronTopologyConfig(
+            tp=variant.topology.tp,
+            cp=variant.topology.cp,
+            ep=variant.topology.ep,
+            etp=variant.topology.etp,
+        ),
+        packed_sequence_length=_variant_packed_sequence_length(variant),
+    )
 
 
 def _variant_max_steps(variant: _TrainabilityVariant) -> int:
@@ -396,13 +600,31 @@ def _default_variant_name(
     *,
     allow_unvalidated_arch: bool = False,
 ) -> _VARIANT_NAME:
+    if override := os.environ.get(_VARIANT_ENV, "").strip():
+        if override not in {"megatron_shared", "megatron_dedicated"}:
+            raise ValueError(
+                f"Unsupported {_VARIANT_ENV}={override!r}. "
+                "Expected 'megatron_shared' or 'megatron_dedicated'."
+            )
+        return cast(_VARIANT_NAME, override)
+    workflow_resources = handler_workflow_resources_for_base_model(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
     if (
-        _rollout_weights_mode(
-            base_model,
-            allow_unvalidated_arch=allow_unvalidated_arch,
-        )
-        == "merged"
+        workflow_resources is not None
+        and workflow_resources.yes_no_trainability_variant is not None
     ):
+        return workflow_resources.yes_no_trainability_variant
+    is_moe = model_uses_expert_parallel(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    rollout_weights_mode = _rollout_weights_mode(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    if rollout_weights_mode == "merged" or not is_moe:
         return "megatron_dedicated"
     return "megatron_shared"
 
@@ -413,16 +635,43 @@ def _build_internal_config(
     base_model: str,
     rollout_weights_mode: RolloutWeightsMode | None = None,
     allow_unvalidated_arch: bool = False,
+    resource_stage_name: _RESOURCE_STAGE_NAME = "yes_no_trainability",
 ) -> dev.InternalModelConfig:
     shared = variant.placement_mode == "shared"
-    inference_gpu_ids = (
-        variant.inference_gpu_ids if not shared else _resolve_shared_gpu_ids()
+    inference_gpu_ids = variant.inference_gpu_ids
+    stage_resources = _trainability_stage_resources(
+        base_model,
+        stage_name=resource_stage_name,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    stage_resources_apply = (
+        not shared
+        and variant.backend_name == "megatron"
+        and stage_resources is not None
+        and stage_resources.megatron is not None
+        and stage_resources.vllm is not None
+        and variant.trainer_gpu_ids == stage_resources.megatron.gpu_ids
+        and variant.inference_gpu_ids == stage_resources.vllm.gpu_ids
+    )
+    if stage_resources_apply:
+        assert stage_resources is not None
+        assert stage_resources.vllm is not None
+        vllm_resources = stage_resources.vllm
+    else:
+        vllm_resources = None
     engine_args = _engine_args_for_yes_no_trainability(
         inference_gpu_ids=inference_gpu_ids,
-        tensor_parallel_size=len(inference_gpu_ids) if shared else 1,
+        tensor_parallel_size=(
+            vllm_resources.tensor_parallel_size
+            if vllm_resources is not None
+            else len(inference_gpu_ids)
+            if shared
+            else 1
+        ),
         enable_expert_parallel=(
-            shared
+            vllm_resources.enable_expert_parallel
+            if vllm_resources is not None
+            else shared
             and variant.backend_name == "megatron"
             and model_uses_expert_parallel(
                 base_model,
@@ -431,6 +680,10 @@ def _build_internal_config(
         ),
         enable_sleep_mode=True if shared else None,
     )
+    if vllm_resources is not None:
+        engine_args.update(vllm_resources.engine_args())
+    elif shared and stage_resources is not None and stage_resources.vllm is not None:
+        engine_args.update(stage_resources.vllm.extra_engine_args)
     engine_args["model"] = base_model
     internal_config = dev.InternalModelConfig(
         rollout_weights_mode=rollout_weights_mode
@@ -442,10 +695,23 @@ def _build_internal_config(
         init_args=_variant_init_args(variant),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    external_runtime = _external_vllm_runtime_config()
+    if (
+        stage_resources is not None
+        and stage_resources.requires_external_vllm
+        and external_runtime is None
+    ):
+        raise RuntimeError(
+            f"{resource_stage_name} for this model requires an external vLLM server. "
+            f"Set {_EXTERNAL_VLLM_URL_ENV}."
+        )
+    if external_runtime is not None:
+        internal_config["vllm_runtime"] = external_runtime
     if not shared:
         internal_config["trainer_gpu_ids"] = variant.trainer_gpu_ids
         internal_config["inference_gpu_ids"] = variant.inference_gpu_ids
-    dev.validate_dedicated_config(internal_config)
+    if not stage_resources_apply:
+        dev.validate_dedicated_config(internal_config)
     return internal_config
 
 
@@ -454,8 +720,9 @@ async def _backend_context(
     variant: _TrainabilityVariant,
     *,
     backend_root: Path,
+    extra_env: dict[str, str] | None = None,
 ) -> AsyncIterator[LocalBackend | MegatronBackend]:
-    with _wandb_disabled():
+    with _wandb_disabled(), _temporary_env(extra_env):
         topology_context = (
             provider_topology_env(variant.topology)
             if variant.topology is not None
@@ -649,6 +916,7 @@ async def run_yes_no_trainability_async(
     artifact_root: Path | None = None,
     rollout_weights_mode: RolloutWeightsMode | None = None,
     allow_unvalidated_arch: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> YesNoTrainabilityReport:
     variant = _build_variant(
         variant_name,
@@ -663,6 +931,7 @@ async def run_yes_no_trainability_async(
     eval_prompt_count = _get_env_int("ART_MODEL_SUPPORT_YES_NO_EVAL_PROMPTS", 8)
     prompts = build_prompts()
     eval_prompts = prompts[:eval_prompt_count]
+    prompt_tree_depth, prompt_tree_branch_count = _prompt_tree_shape(prompts)
     internal_config = _build_internal_config(
         variant,
         base_model=base_model,
@@ -670,6 +939,7 @@ async def run_yes_no_trainability_async(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     rollout_weights_mode = internal_config["rollout_weights_mode"]
+    _init_megatron_runtime_config(variant)
     model = art.TrainableModel(
         name=f"{variant.name}-{uuid.uuid4().hex[:8]}",
         project="model-support-validation",
@@ -678,8 +948,28 @@ async def run_yes_no_trainability_async(
         report_metrics=[],
     )
     train_kwargs = _variant_train_kwargs(variant)
+    workflow_resources = handler_workflow_resources_for_base_model(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    stage_resources = (
+        workflow_resources.yes_no_trainability
+        if workflow_resources is not None
+        else None
+    )
+    if stage_resources is not None:
+        stage_resources = resolve_stage_resources_for_current_host(
+            "yes_no_trainability",
+            stage_resources,
+        )
+    backend_env = {
+        **(stage_resources.megatron_env if stage_resources is not None else {}),
+        **(extra_env or {}),
+    }
 
-    async with _backend_context(variant, backend_root=backend_root) as backend:
+    async with _backend_context(
+        variant, backend_root=backend_root, extra_env=backend_env
+    ) as backend:
         await model.register(backend)
         output_dir = Path(model.base_path) / model.project / "models" / model.name
         await _warmup_model(model, base_model=base_model, prompt=prompts[0])
@@ -707,6 +997,8 @@ async def run_yes_no_trainability_async(
             prompt_count=len(prompts),
             eval_prompt_count=len(eval_prompts),
             rollouts_per_prompt=rollouts_per_prompt,
+            prompt_tree_depth=prompt_tree_depth,
+            prompt_tree_branch_count=prompt_tree_branch_count,
             latest_step=0,
             initial_eval_reward=initial_eval_reward,
             step0_name=step0_name,
@@ -796,6 +1088,26 @@ def run_yes_no_trainability(
             allow_unvalidated_arch=allow_unvalidated_arch,
         )
     )
+
+
+def yes_no_trainability_passed(report: YesNoTrainabilityReport) -> bool:
+    learned_from_below_threshold = (
+        report.saturated_step is not None
+        and report.saturated_step > 0
+        and report.initial_eval_reward < report.reward_threshold
+        and report.final_eval_reward is not None
+        and report.final_eval_reward >= report.reward_threshold
+        and report.final_eval_reward > report.initial_eval_reward
+    )
+    already_saturated_and_stable = (
+        report.initial_eval_reward >= report.reward_threshold
+        and report.latest_step > 0
+        and report.final_eval_reward is not None
+        and report.final_eval_reward >= report.reward_threshold
+        and bool(report.steps)
+        and any(step.train_metrics.get("grad_norm", 0.0) > 0.0 for step in report.steps)
+    )
+    return learned_from_below_threshold or already_saturated_and_stable
 
 
 def run_megatron_dedicated_yes_no_trainability(

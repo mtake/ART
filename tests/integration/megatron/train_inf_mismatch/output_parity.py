@@ -1,28 +1,61 @@
 from __future__ import annotations
 
-import argparse
-import asyncio
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import Sequence
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import random
-import shutil
-import socket
-import subprocess
-import sys
-import time
-from typing import Any, AsyncIterator, Literal, cast
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .artifacts import REPO_ROOT
+from art.megatron.prefix_tree import parse_prefix_tree_row
 
-BF16_FWD_MEAN_ABS_PCT_LIMIT = 3.0
+from ..model_support.workflow_resources import (
+    handler_workflow_resources_for_base_model,
+    resolve_stage_resources_for_current_host,
+)
+
+# These gates are intentionally bf16-scale, not fp32 oracle-scale. A 2026-05-18
+# Qwen/Qwen3.5-35B-A3B diagnostic on the exact same real generated tokens found:
+# vLLM generation vs Megatron: 2.916% mean_abs_pct, 0.0123 MAE, 0.883 top1,
+# 0.976 top20; vLLM prompt_logprobs vs Megatron: 7.896%, 0.0334 MAE, 0.969
+# top1, 0.941 top20; vLLM generation vs vLLM prompt_logprobs: 7.517%, 0.0322
+# MAE, 0.879 top1, 0.941 top20. The real ART path also canonicalizes shared
+# prefix routes when vLLM produced different routes for the same prefix. Do not
+# tighten these thresholds without rechecking both vLLM self-mismatch and shared
+# prefix route-conflict behavior on the measured path. With the workflow's
+# 16-token completions, Qwen3.5 MoE reruns on 2026-05-25 measured 4.169% and
+# 4.606% mean_abs_pct while staying under the KL gate, so its gate is 5%.
+# DeepSeek-V4-Flash uses vLLM quantized DSV4 kernels on the serving side while
+# Megatron materializes train-time bf16/fp32 tensors. A 2026-06-18 diagnostic
+# measured non-QAT Megatron vs vLLM generation at 19.016% mean_abs_pct and
+# 0.02603 candidate->target top20 KL; vLLM generation vs exact vLLM prompt
+# rescore was already 15.176% mean_abs_pct and 0.04424 KL.
+BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
+BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
+    "dsv4": 20.0,
+    # Gemma 4 MoE long-prompt SWA native-LoRA runs showed high variation, with
+    # repeated samples reaching 7.6% mean_abs_pct and 0.0076 KL.
+    "gemma4_dense": 8.0,
+    "gemma4_moe": 8.0,
+    "qwen3_moe": 7.0,
+    "qwen3_5_moe": 5.0,
+}
+TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
+TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY = {
+    "dsv4": 0.07,
+    "gemma4_dense": 0.003,
+    "gemma4_moe": 0.008,
+    # GPT OSS MXFP4/native-LoRA repeats on 2026-07-06 stayed under the 4%
+    # mean_abs_pct gate but measured 0.00186-0.00256 top20 KL.
+    "gpt_oss_moe": 0.003,
+}
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
+ScoreRecord = tuple[int, float, list[int], list[float]]
 
 RolloutMode = Literal["native_lora", "merged"]
 EngineSide = Literal["megatron", "vllm"]
@@ -32,21 +65,31 @@ WeightState = Literal["base", "lora"]
 class Topology(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    tp: int = 2
+    tp: int = 1
     ep: int = 2
     etp: int = 1
     dp: int = 1
-    cp: int = 1
+    cp: int = 2
     pp: int = 1
 
     def world_size(self) -> int:
-        return self.tp * self.dp * self.cp * self.pp
+        dense_world = self.tp * self.cp * self.pp * self.dp
+        expert_model_size = self.etp * self.ep * self.pp
+        if dense_world % expert_model_size != 0:
+            raise ValueError(
+                "Invalid Megatron MoE topology: "
+                f"tp*cp*pp*dp={dense_world} must be divisible by "
+                f"etp*ep*pp={expert_model_size}"
+            )
+        return dense_world
 
     def env(self) -> dict[str, str]:
         return {
             "ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE": str(self.tp),
             "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE": str(self.ep),
             "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE": str(self.etp),
+            "ART_MEGATRON_CONTEXT_PARALLEL_SIZE": str(self.cp),
+            "ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE": str(self.pp),
         }
 
     def slug(self) -> str:
@@ -78,6 +121,10 @@ class TrainInfOutputParityConfig(BaseModel):
     lora_target_modules: list[str] | None = None
     engine_args: dict[str, Any] = Field(default_factory=dict)
     server_args: dict[str, Any] = Field(default_factory=dict)
+    megatron_env: dict[str, str] = Field(default_factory=dict)
+    replay_vllm_routing: bool = False
+    external_vllm_server_url: str | None = None
+    external_vllm_api_key: str | None = None
 
     @model_validator(mode="after")
     def _set_default_rollout_modes(self) -> "TrainInfOutputParityConfig":
@@ -94,6 +141,10 @@ class LogicalPrompt(BaseModel):
     sample_id: int
     family_id: int
     completion_id: int
+    # ART stores the final context token at the start of each leaf segment, so
+    # vLLM's generated-token logprobs start one token after the ancestor path.
+    packed_prompt_length: int
+    scored_token_start_index: int
     token_ids: list[int]
 
 
@@ -163,34 +214,6 @@ class RolloutComparison(BaseModel):
     lora_topk: TopKComparison
 
 
-class TrainInfOutputParityReport(BaseModel):
-    base_model: str
-    artifact_dir: str
-    topology: str
-    trainer_gpu_ids: list[int]
-    inference_gpu_ids: list[int]
-    logical_prompt_count: int
-    logical_token_count: int
-    adapter_path: str
-    megatron_base_scores: str
-    megatron_lora_scores: str
-    rollout_comparisons: list[RolloutComparison]
-    passed: bool
-
-
-class MegatronWorkerRequest(BaseModel):
-    config: TrainInfOutputParityConfig
-    artifact_dir: str
-    weight_state: WeightState
-    adapter_path: str | None = None
-
-
-class MegatronWorkerResult(BaseModel):
-    score_path: str
-    logical_map_path: str
-    adapter_path: str | None = None
-
-
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -204,12 +227,6 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError(f"Expected JSON object in {path}")
     return value
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _parse_gpu_ids(value: str | None, default: list[int]) -> list[int]:
@@ -253,22 +270,79 @@ def default_rollout_modes_for_model(
     return modes
 
 
-@contextmanager
-def _provider_topology_env(topology: Topology) -> Any:
-    names = topology.env()
-    previous = {name: os.environ.get(name) for name in names}
-    os.environ.update(names)
-    try:
-        yield
-    finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+def fwd_mean_abs_pct_limit_for_model(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> float:
+    from art.megatron.model_support.registry import get_model_support_spec
+
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    return BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY.get(
+        spec.key,
+        BF16_FWD_MEAN_ABS_PCT_LIMIT,
+    )
+
+
+def top20_kl_candidate_to_target_limit_for_model(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> float:
+    from art.megatron.model_support.registry import get_model_support_spec
+
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    return TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY.get(
+        spec.key,
+        TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
+    )
+
+
+def model_support_is_moe(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> bool:
+    from art.megatron.model_support.registry import (
+        get_model_support_handler_for_spec,
+        get_model_support_spec,
+    )
+
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    return get_model_support_handler_for_spec(spec).is_moe
+
+
+def model_supports_context_parallel(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> bool:
+    from art.megatron.model_support.registry import (
+        get_model_support_handler_for_spec,
+        get_model_support_spec,
+    )
+
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    return bool(getattr(get_model_support_handler_for_spec(spec), "cp_supported", True))
 
 
 def config_from_env() -> TrainInfOutputParityConfig:
+    train_inf_external_url_env = "ART_TRAIN_INF_MISMATCH_EXTERNAL_VLLM_URL"
+    model_support_external_url_env = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL"
+    train_inf_external_key_env = "ART_TRAIN_INF_MISMATCH_EXTERNAL_VLLM_API_KEY"
+    model_support_external_key_env = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY"
     config = TrainInfOutputParityConfig(
         base_model=os.environ.get(
             "ART_TRAIN_INF_MISMATCH_BASE_MODEL",
@@ -287,6 +361,44 @@ def config_from_env() -> TrainInfOutputParityConfig:
         )
         == "1",
     )
+    workflow_resources = handler_workflow_resources_for_base_model(
+        config.base_model,
+        allow_unvalidated_arch=config.allow_unvalidated_arch,
+    )
+    stage_resources = (
+        workflow_resources.train_inf_mismatch
+        if workflow_resources is not None
+        else None
+    )
+    if stage_resources is not None:
+        stage_resources = resolve_stage_resources_for_current_host(
+            "train_inf_mismatch",
+            stage_resources,
+        )
+    if stage_resources is not None:
+        if (
+            stage_resources.megatron is not None
+            and "ART_TRAIN_INF_MISMATCH_TRAINER_GPU_IDS" not in os.environ
+        ):
+            config.trainer_gpu_ids = list(stage_resources.megatron.gpu_ids)
+        if (
+            stage_resources.vllm is not None
+            and "ART_TRAIN_INF_MISMATCH_INFERENCE_GPU_IDS" not in os.environ
+        ):
+            config.inference_gpu_ids = list(stage_resources.vllm.gpu_ids)
+        if stage_resources.megatron is not None:
+            config.topology = config.topology.model_copy(
+                update=stage_resources.megatron.topology.to_train_inf_topology_kwargs()
+            )
+        if stage_resources.vllm is not None:
+            config.engine_args = {
+                **stage_resources.vllm.engine_args(),
+                **config.engine_args,
+            }
+        config.megatron_env = {
+            **stage_resources.megatron_env,
+            **config.megatron_env,
+        }
     if raw_modes := os.environ.get("ART_TRAIN_INF_MISMATCH_ROLLOUT_MODES"):
         config.rollout_modes = _parse_rollout_modes(raw_modes)
     if raw_seq_len := os.environ.get("ART_TRAIN_INF_MISMATCH_SEQUENCE_LENGTH"):
@@ -295,105 +407,175 @@ def config_from_env() -> TrainInfOutputParityConfig:
         config.packed.prefill_tokens = int(raw_prefill)
     if raw_decode := os.environ.get("ART_TRAIN_INF_MISMATCH_DECODE_TOKENS"):
         config.packed.decode_tokens = int(raw_decode)
+    for env_name, attr in (
+        ("ART_TRAIN_INF_MISMATCH_TP", "tp"),
+        ("ART_TRAIN_INF_MISMATCH_EP", "ep"),
+        ("ART_TRAIN_INF_MISMATCH_ETP", "etp"),
+        ("ART_TRAIN_INF_MISMATCH_DP", "dp"),
+        ("ART_TRAIN_INF_MISMATCH_CP", "cp"),
+        ("ART_TRAIN_INF_MISMATCH_PP", "pp"),
+    ):
+        if raw_value := os.environ.get(env_name):
+            config.topology = config.topology.model_copy(update={attr: int(raw_value)})
+    is_moe = model_support_is_moe(
+        config.base_model,
+        allow_unvalidated_arch=config.allow_unvalidated_arch,
+    )
+    cp_supported = model_supports_context_parallel(
+        config.base_model,
+        allow_unvalidated_arch=config.allow_unvalidated_arch,
+    )
+    if not is_moe:
+        config.topology = config.topology.model_copy(update={"ep": 1, "etp": 1})
+    if not cp_supported and "ART_TRAIN_INF_MISMATCH_CP" not in os.environ:
+        updates = {"cp": 1}
+        if stage_resources is None and "ART_TRAIN_INF_MISMATCH_DP" not in os.environ:
+            updates["dp"] = config.topology.dp * config.topology.cp
+        config.topology = config.topology.model_copy(update=updates)
     if raw_targets := os.environ.get("ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES"):
         config.lora_target_modules = _parse_str_list(raw_targets)
+    if raw_vllm_memory := os.environ.get(
+        "ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION"
+    ):
+        config.engine_args["gpu_memory_utilization"] = float(raw_vllm_memory)
+    if raw_gdn_backend := os.environ.get("ART_TRAIN_INF_MISMATCH_GDN_PREFILL_BACKEND"):
+        raw_additional_config = config.engine_args.get("additional_config")
+        additional_config: dict[str, Any] = {}
+        if isinstance(raw_additional_config, dict):
+            additional_config.update(cast(dict[str, Any], raw_additional_config))
+        additional_config["gdn_prefill_backend"] = raw_gdn_backend
+        config.engine_args["additional_config"] = additional_config
+    raw_url = os.environ.get(train_inf_external_url_env)
+    if raw_url is None and stage_resources is not None:
+        raw_url = os.environ.get(model_support_external_url_env)
+    if raw_url:
+        config.external_vllm_server_url = raw_url
+        config.external_vllm_api_key = os.environ.get(
+            train_inf_external_key_env,
+            os.environ.get(
+                model_support_external_key_env,
+                "art-external-vllm",
+            ),
+        )
+    if (
+        stage_resources is not None
+        and stage_resources.requires_external_vllm
+        and not config.external_vllm_server_url
+    ):
+        raise RuntimeError(
+            "train_inf_mismatch for this model requires an external vLLM server. "
+            f"Set {train_inf_external_url_env} or {model_support_external_url_env}."
+        )
     return config
 
 
-def _prompt_family_segments(
+def _prefix_tree_leaf_paths(
     group_ids: Any,
     parent_ids: Any,
     *,
-    required_completion_count: int = 1,
-) -> list[tuple[tuple[int, int], list[tuple[int, int]]]]:
-    valid_tokens = int((group_ids != -1).sum().item())
-    families: list[tuple[tuple[int, int], list[tuple[int, int]]]] = []
-    cursor = 0
-    while cursor < valid_tokens:
-        group_id = int(group_ids[cursor].item())
-        parent_id = int(parent_ids[cursor].item())
-        prompt_start = cursor
-        while cursor < valid_tokens and int(group_ids[cursor].item()) == group_id:
-            cursor += 1
-        prompt_end = cursor
-        if group_id != parent_id:
+    required_leaf_count: int = 1,
+) -> list[tuple[int, tuple[tuple[int, int], ...], tuple[int, int]]]:
+    tree = parse_prefix_tree_row(group_ids=group_ids, parent_ids=parent_ids)
+    segment_by_group = {segment.group_id: segment for segment in tree.segments}
+    child_count_by_group: dict[int, int] = {}
+    for segment in tree.segments:
+        if segment.group_id == segment.parent_id:
             continue
-        completions: list[tuple[int, int]] = []
-        while cursor < valid_tokens:
-            completion_group_id = int(group_ids[cursor].item())
-            completion_parent_id = int(parent_ids[cursor].item())
-            if completion_parent_id != group_id or completion_group_id == group_id:
-                break
-            completion_start = cursor
-            while (
-                cursor < valid_tokens
-                and int(group_ids[cursor].item()) == completion_group_id
-            ):
-                cursor += 1
-            completions.append((completion_start, cursor))
-        if len(completions) >= required_completion_count:
-            families.append(((prompt_start, prompt_end), completions))
-    return families
+        child_count_by_group[segment.parent_id] = (
+            child_count_by_group.get(segment.parent_id, 0) + 1
+        )
+    paths = [
+        (
+            leaf.family_index,
+            tuple(
+                (segment_by_group[group_id].start, segment_by_group[group_id].end)
+                for group_id in leaf.ancestors
+            ),
+            (leaf.start, leaf.end),
+        )
+        for leaf in tree.segments
+        if leaf.group_id != leaf.parent_id
+        and child_count_by_group.get(leaf.group_id, 0) == 0
+        and leaf.end - leaf.start >= 2
+    ]
+    return paths if len(paths) >= required_leaf_count else []
 
 
 def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
     tokens = packed_tensors["tokens"]
     group_ids = packed_tensors["group_ids"]
     parent_ids = packed_tensors["parent_ids"]
+    assistant_mask = packed_tensors.get("assistant_mask")
+    logprobs = packed_tensors.get("logprobs")
     prompts: list[LogicalPrompt] = []
     logical_tokens: list[LogicalToken] = []
     prompt_id_by_tokens: dict[tuple[int, ...], int] = {}
 
+    def scored_token(sample_id: int, packed_i: int) -> bool:
+        if assistant_mask is not None and not bool(assistant_mask[sample_id, packed_i]):
+            return False
+        if logprobs is not None:
+            value = float(logprobs[sample_id, packed_i])
+            if math.isnan(value):
+                return False
+        return True
+
     for sample_id in range(int(tokens.shape[0])):
-        families = _prompt_family_segments(group_ids[sample_id], parent_ids[sample_id])
-        for family_id, (prompt_segment, completion_segments) in enumerate(families):
-            prompt_start, prompt_end = prompt_segment
-            prompt_len = prompt_end - prompt_start
-            for completion_id, (completion_start, completion_end) in enumerate(
-                completion_segments
-            ):
-                if completion_end - completion_start < 2:
+        leaf_paths = _prefix_tree_leaf_paths(
+            group_ids[sample_id], parent_ids[sample_id]
+        )
+        for completion_id, (family_id, ancestor_segments, leaf_segment) in enumerate(
+            leaf_paths
+        ):
+            leaf_start, leaf_end = leaf_segment
+            last_scored_i = None
+            for packed_i in range(leaf_start + 1, leaf_end):
+                if scored_token(sample_id, packed_i):
+                    last_scored_i = packed_i
+            if last_scored_i is None:
+                continue
+            effective_leaf_end = last_scored_i + 1
+            prompt_len = sum(end - start for start, end in ancestor_segments)
+            reference_segments = (*ancestor_segments, (leaf_start, effective_leaf_end))
+            flat = [
+                int(value)
+                for start, end in reference_segments
+                for value in tokens[sample_id, start:end].tolist()
+            ]
+            flat_key = tuple(flat)
+            prompt_id = prompt_id_by_tokens.get(flat_key)
+            if prompt_id is None:
+                prompt_id = len(prompts)
+                prompt_id_by_tokens[flat_key] = prompt_id
+                prompts.append(
+                    LogicalPrompt(
+                        prompt_id=prompt_id,
+                        sample_id=sample_id,
+                        family_id=family_id,
+                        completion_id=completion_id,
+                        packed_prompt_length=prompt_len,
+                        scored_token_start_index=prompt_len + 1,
+                        token_ids=flat,
+                    )
+                )
+            for packed_i in range(leaf_start + 1, effective_leaf_end):
+                if not scored_token(sample_id, packed_i):
                     continue
-                flat = [
-                    int(value)
-                    for value in tokens[sample_id, prompt_start:prompt_end].tolist()
-                ] + [
-                    int(value)
-                    for value in tokens[
-                        sample_id, completion_start:completion_end
-                    ].tolist()
-                ]
-                flat_key = tuple(flat)
-                prompt_id = prompt_id_by_tokens.get(flat_key)
-                if prompt_id is None:
-                    prompt_id = len(prompts)
-                    prompt_id_by_tokens[flat_key] = prompt_id
-                    prompts.append(
-                        LogicalPrompt(
-                            prompt_id=prompt_id,
-                            sample_id=sample_id,
-                            family_id=family_id,
-                            completion_id=completion_id,
-                            token_ids=flat,
-                        )
+                logical_tokens.append(
+                    LogicalToken(
+                        token_id=int(tokens[sample_id, packed_i].item()),
+                        sample_id=sample_id,
+                        family_id=family_id,
+                        completion_id=completion_id,
+                        prompt_id=prompt_id,
+                        art_packed_token_index=packed_i,
+                        art_logit_index=packed_i - 1,
+                        vllm_prompt_token_index=prompt_len + (packed_i - leaf_start),
                     )
-                for packed_i in range(completion_start + 1, completion_end):
-                    logical_tokens.append(
-                        LogicalToken(
-                            token_id=int(tokens[sample_id, packed_i].item()),
-                            sample_id=sample_id,
-                            family_id=family_id,
-                            completion_id=completion_id,
-                            prompt_id=prompt_id,
-                            art_packed_token_index=packed_i,
-                            art_logit_index=packed_i - 1,
-                            vllm_prompt_token_index=prompt_len
-                            + (packed_i - completion_start),
-                        )
-                    )
+                )
 
     if not prompts or not logical_tokens:
-        raise RuntimeError("Shared-prefix probe produced no comparable logical tokens")
+        raise RuntimeError("Prefix-tree probe produced no comparable logical tokens")
     return LogicalTokenMap(prompts=prompts, tokens=logical_tokens)
 
 
@@ -563,15 +745,15 @@ def compare_rollout(
     vl = torch.tensor(vllm_lora.target_logprobs, dtype=torch.float32)
     return RolloutComparison(
         rollout_mode=rollout_mode,
-        base=compare_pair(candidate=vb, target=mb, sequence_ids=sequence_ids),
-        lora=compare_pair(candidate=vl, target=ml, sequence_ids=sequence_ids),
+        base=compare_pair(candidate=mb, target=vb, sequence_ids=sequence_ids),
+        lora=compare_pair(candidate=ml, target=vl, sequence_ids=sequence_ids),
         delta=compare_pair(
-            candidate=vl - vb,
-            target=ml - mb,
+            candidate=ml - mb,
+            target=vl - vb,
             sequence_ids=sequence_ids,
         ),
-        base_topk=compare_topk(vllm_base, megatron_base),
-        lora_topk=compare_topk(vllm_lora, megatron_lora),
+        base_topk=compare_topk(megatron_base, vllm_base),
+        lora_topk=compare_topk(megatron_lora, vllm_lora),
     )
 
 
@@ -586,36 +768,93 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _packed_tensor_config(config: TrainInfOutputParityConfig) -> Any:
-    from ..model_support.oracle_harness import PackedTensorConfig
-
-    return PackedTensorConfig(
-        num_sequences=config.packed.num_sequences,
-        sequence_length=config.packed.sequence_length,
-        prefill_tokens=config.packed.prefill_tokens,
-        completion_branches_per_prefix=config.packed.completion_branches_per_prefix,
-        decode_tokens=config.packed.decode_tokens,
-        decode_tokens_jitter=config.packed.decode_tokens_jitter,
-        vocab_high=config.packed.vocab_high,
-        packing_mode=config.packed.packing_mode,
-    )
-
-
-def _build_packed_tensors(config: TrainInfOutputParityConfig) -> dict[str, Any]:
-    from ..model_support.packed_position_ids import (
-        _build_art_realistic_packed_tensors,
-    )
-
-    return _build_art_realistic_packed_tensors(
-        _packed_tensor_config(config), config.seed
-    )
-
-
 def _configure_provider(provider: Any, config: TrainInfOutputParityConfig) -> None:
+    provider.tensor_model_parallel_size = config.topology.tp
+    provider.expert_model_parallel_size = config.topology.ep
+    provider.expert_tensor_parallel_size = config.topology.etp
+    provider.context_parallel_size = config.topology.cp
+    provider.pipeline_model_parallel_size = config.topology.pp
     if hasattr(provider, "attention_dropout"):
         provider.attention_dropout = 0.0
     if hasattr(provider, "hidden_dropout"):
         provider.hidden_dropout = 0.0
+
+
+def _gather_context_parallel_logits(logits: Any, *, full_sequence_length: int) -> Any:
+    from megatron.core import parallel_state as ps
+    import torch
+    import torch.distributed as dist
+
+    if int(ps.get_context_parallel_world_size()) <= 1:
+        return logits
+    if int(logits.shape[1]) == full_sequence_length:
+        return logits
+    cp_size = int(ps.get_context_parallel_world_size())
+    local_chunks = [torch.empty_like(logits) for _ in range(cp_size)]
+    dist.all_gather(  # ty: ignore[possibly-missing-attribute]
+        local_chunks, logits.contiguous(), group=ps.get_context_parallel_group()
+    )
+    local_sequence_length = int(logits.shape[1])
+    if local_sequence_length % 2 != 0:
+        raise RuntimeError(
+            "Cannot reconstruct context-parallel logits with odd local sequence "
+            f"length {local_sequence_length}"
+        )
+    half = local_sequence_length // 2
+    ordered = [chunk[:, :half] for chunk in local_chunks]
+    ordered.extend(chunk[:, half:] for chunk in reversed(local_chunks))
+    gathered = torch.cat(ordered, dim=1)
+    if int(gathered.shape[1]) != full_sequence_length:
+        raise RuntimeError(
+            "Context-parallel logit gather produced unexpected sequence length: "
+            f"{int(gathered.shape[1])} != {full_sequence_length}"
+        )
+    return gathered
+
+
+def _packed_valid_lengths(packed_tensors: dict[str, Any]) -> list[int]:
+    return [
+        int((packed_tensors["group_ids"][row_index] != -1).sum().item())
+        for row_index in range(int(packed_tensors["group_ids"].shape[0]))
+    ]
+
+
+def logical_logit_uids(
+    *,
+    packed_tensors: dict[str, Any],
+    logical_tokens: Sequence[LogicalToken],
+    sample_id_to_row: dict[int, int] | None = None,
+) -> list[int]:
+    valid_lengths = _packed_valid_lengths(packed_tensors)
+    row_offsets: list[int] = []
+    cursor = 0
+    for valid_length in valid_lengths:
+        row_offsets.append(cursor)
+        cursor += valid_length
+    uids: list[int] = []
+    for token in logical_tokens:
+        row_index = (
+            sample_id_to_row[token.sample_id]
+            if sample_id_to_row is not None
+            else token.sample_id
+        )
+        if row_index < 0 or row_index >= len(valid_lengths):
+            raise RuntimeError(
+                "Logical token sample does not map to a packed row: "
+                f"sample_id={token.sample_id}, row={row_index}"
+            )
+        if (
+            token.art_logit_index < 0
+            or token.art_logit_index >= valid_lengths[row_index]
+        ):
+            raise RuntimeError(
+                "Logical token logit index is outside packed valid tokens: "
+                f"sample_id={token.sample_id}, row={row_index}, "
+                f"logit_index={token.art_logit_index}, "
+                f"valid_length={valid_lengths[row_index]}"
+            )
+        uids.append(row_offsets[row_index] + token.art_logit_index)
+    return uids
 
 
 def _lora_target_modules(config: TrainInfOutputParityConfig) -> list[str]:
@@ -657,7 +896,7 @@ def _build_deterministic_nonzero_lora(
 
 
 def _merge_sharded_lora(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]:
-    from art.megatron.weights.merge import merge_sharded_adapter_entries
+    from art.megatron.weights.lora_publish import merge_sharded_adapter_entries
 
     entries_by_key: dict[str, list[tuple[dict[str, Any], Any]]] = {}
     for rank_entry in shards_by_rank:
@@ -706,7 +945,12 @@ def _adapter_config(config: TrainInfOutputParityConfig) -> dict[str, Any]:
 
     return LoraConfig(
         base_model_name_or_path=config.base_model,
-        r=default_lora_rank_for_handler(get_model_support_handler(config.base_model)),
+        r=default_lora_rank_for_handler(
+            get_model_support_handler(
+                config.base_model,
+                allow_unvalidated_arch=config.allow_unvalidated_arch,
+            )
+        ),
         lora_alpha=LORA_ALPHA,
         target_modules=_lora_target_modules(config),
         bias="none",
@@ -749,19 +993,40 @@ def _run_logits(
 ) -> Any:
     import torch
 
-    from art.megatron.flex_attention import create_shared_prefix_attention_state
+    from art.megatron.prefix_tree_state import create_prefix_tree_state
+    from art.megatron.training.trace import (
+        packed_sequence_token_uids,
+        prepare_replay_local_input_token_uids,
+    )
+    from art.preprocessing.pack import PackedTensors
 
     device = next(runtime.model[0].parameters()).device
     input_ids = packed_tensors["tokens"].to(device=device)
     position_ids = packed_tensors["input_pos"].to(device=device)
     group_ids = packed_tensors["group_ids"].to(device=device)
     parent_ids = packed_tensors["parent_ids"].to(device=device)
-    attention_state = create_shared_prefix_attention_state(
+    attention_state = create_prefix_tree_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
+        input_pos=position_ids,
+        sliding_windows=tuple(
+            int(window)
+            for window in getattr(runtime.provider, "art_flex_sliding_windows", ())
+        ),
+        build_gdn_execution_spec=bool(
+            getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
+        ),
+        model_support_handler=runtime.model_support_handler,
+        attention_head_dim=getattr(runtime.provider, "kv_channels", None),
+        attention_value_head_dim=getattr(runtime.provider, "kv_channels", None),
+    )
+    prepare_replay_local_input_token_uids(
+        runtime.moe_routing_replay_controller,
+        packed_sequence_token_uids(cast(PackedTensors, packed_tensors), device=device),
+        attention_state,
     )
     with torch.no_grad():
-        return runtime.model[0](
+        logits = runtime.model[0](
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device),
@@ -771,6 +1036,298 @@ def _run_logits(
                 attention_bias=attention_state,
             ),
         )
+        from megatron.core import parallel_state, tensor_parallel
+
+        if (
+            parallel_state.model_parallel_is_initialized()
+            and parallel_state.get_tensor_model_parallel_world_size() > 1
+        ):
+            logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
+        logits = _gather_context_parallel_logits(
+            logits,
+            full_sequence_length=int(input_ids.shape[1]),
+        )
+        return logits
+
+
+def _batch_seq_logits(logits: Any, labels: Any) -> Any:
+    if int(logits.ndim) != 3:
+        raise RuntimeError(
+            f"Expected logits [B, S, V] or [S, B, V], got {logits.shape}"
+        )
+    if tuple(logits.shape[:2]) == tuple(labels.shape):
+        return logits
+    if tuple(logits.shape[:2]) == (int(labels.shape[1]), int(labels.shape[0])):
+        return logits.transpose(0, 1).contiguous()
+    raise RuntimeError(
+        "Logits do not align with local labels: "
+        f"logits={tuple(logits.shape)}, labels={tuple(labels.shape)}"
+    )
+
+
+def _local_score_records_from_logits(
+    *,
+    logits: Any,
+    labels: Any,
+    token_uids: Any,
+    desired_uids: set[int],
+) -> dict[int, ScoreRecord]:
+    import torch
+
+    if token_uids is None:
+        raise RuntimeError("CP train/inf scoring requires local token_uids")
+    logits = _batch_seq_logits(logits, labels)
+    if tuple(token_uids.shape) != tuple(labels.shape):
+        raise RuntimeError(
+            "CP token uid shape does not match labels: "
+            f"uids={tuple(token_uids.shape)}, labels={tuple(labels.shape)}"
+        )
+    if not desired_uids:
+        return {}
+    records: dict[int, ScoreRecord] = {}
+    log_probs = torch.log_softmax(logits.detach().float(), dim=-1)
+    labels_cpu = labels.detach().to(device="cpu")
+    token_uids_cpu = token_uids.detach().to(device="cpu")
+    mask = (labels_cpu != -100) & (token_uids_cpu >= 0)
+    for batch_index, seq_index in torch.nonzero(mask, as_tuple=False).tolist():
+        uid = int(token_uids_cpu[batch_index, seq_index].item())
+        if uid not in desired_uids:
+            continue
+        row = log_probs[batch_index, seq_index]
+        token_id = int(labels_cpu[batch_index, seq_index].item())
+        values, indices = torch.topk(row, TOP_K)
+        records[uid] = (
+            token_id,
+            float(row[token_id].item()),
+            [int(value) for value in indices.tolist()],
+            [float(value) for value in values.tolist()],
+        )
+    return records
+
+
+def _merge_score_records(
+    shards: Sequence[dict[int, ScoreRecord]],
+) -> dict[int, ScoreRecord]:
+    merged: dict[int, ScoreRecord] = {}
+    for shard in shards:
+        for uid, record in shard.items():
+            previous = merged.get(uid)
+            if previous is not None and previous != record:
+                raise RuntimeError(f"Duplicate CP score record for uid={uid}")
+            merged[uid] = record
+    return merged
+
+
+def _score_bundle_from_records(
+    *,
+    records: dict[int, ScoreRecord],
+    logical_tokens: Sequence[LogicalToken],
+    logical_uids: Sequence[int],
+    side: EngineSide,
+    weight_state: WeightState,
+    rollout_mode: RolloutMode | None,
+) -> ScoreBundle:
+    target_logprobs: list[float] = []
+    topk: list[TokenTopK] = []
+    missing: list[int] = []
+    for token, uid in zip(logical_tokens, logical_uids, strict=True):
+        record = records.get(uid)
+        if record is None:
+            missing.append(uid)
+            continue
+        token_id, target_logprob, topk_ids, topk_logprobs = record
+        if token_id != token.token_id:
+            raise RuntimeError(
+                "CP score record target token does not match logical token: "
+                f"uid={uid}, record={token_id}, logical={token.token_id}"
+            )
+        target_logprobs.append(target_logprob)
+        topk.append(TokenTopK(token_ids=topk_ids, logprobs=topk_logprobs))
+    if missing:
+        raise RuntimeError(
+            "Missing CP score records for logical tokens: "
+            f"{missing[:16]} of {len(missing)} missing"
+        )
+    return ScoreBundle(
+        side=side,
+        weight_state=weight_state,
+        rollout_mode=rollout_mode,
+        target_logprobs=target_logprobs,
+        topk=topk,
+    )
+
+
+def _score_context_parallel_once(
+    *,
+    runtime: Any,
+    packed_tensors: dict[str, Any],
+    logical_tokens: Sequence[LogicalToken],
+    sample_id_to_row: dict[int, int] | None,
+    side: EngineSide,
+    weight_state: WeightState,
+    rollout_mode: RolloutMode | None,
+) -> ScoreBundle:
+    from megatron.core import parallel_state as ps
+    from megatron.core import tensor_parallel
+    import torch
+    import torch.distributed as dist
+
+    dist_any = cast(Any, dist)
+    from art.megatron.context_parallel.types import ParallelTopology
+    from art.megatron.training.microbatches import _prepare_current_rl_micro
+    from art.megatron.training.trace import (
+        attach_trace_token_uids,
+        prepare_replay_local_input_token_uids,
+    )
+
+    model_chunks = cast(list[Any], runtime.model)
+    device = next(model_chunks[0].parameters()).device
+    topology = ParallelTopology(
+        tp=ps.get_tensor_model_parallel_world_size(),
+        cp=ps.get_context_parallel_world_size(),
+        dp=ps.get_data_parallel_world_size(),
+        pp=ps.get_pipeline_model_parallel_world_size(),
+        sp=bool(getattr(runtime.provider, "sequence_parallel", False)),
+    )
+    prepared_micro, pending = _prepare_current_rl_micro(
+        cast(Any, packed_tensors),
+        device=device,
+        topology=topology,
+        provider=runtime.provider,
+        model_support_handler=runtime.model_support_handler,
+        ref_logprobs=None,
+        trace_token_uids=True,
+        pending_prepared_micro=None,
+    )
+    if pending is not None:
+        raise RuntimeError("CP train/inf scoring unexpectedly returned lookahead state")
+    prepare_replay_local_input_token_uids(
+        runtime.moe_routing_replay_controller,
+        prepared_micro.local_token_uids,
+        prepared_micro.attention_state,
+    )
+    with (
+        torch.no_grad(),
+        attach_trace_token_uids(
+            model_chunks,
+            prepared_micro.local_token_uids,
+        ),
+    ):
+        logits = model_chunks[0](
+            input_ids=prepared_micro.model_tokens,
+            position_ids=prepared_micro.model_input_pos,
+            attention_mask=torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device),
+            labels=None,
+            packed_seq_params=prepared_micro.packed_seq_params,
+            **runtime.model_support_handler.get_forward_kwargs(
+                model_chunks[0],
+                attention_bias=prepared_micro.attention_state,
+            ),
+        )
+    if ps.get_tensor_model_parallel_world_size() > 1:
+        logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
+    logical_uids = logical_logit_uids(
+        packed_tensors=packed_tensors,
+        logical_tokens=logical_tokens,
+        sample_id_to_row=sample_id_to_row,
+    )
+    local_records: dict[int, ScoreRecord] = {}
+    if ps.get_tensor_model_parallel_rank() == 0:
+        local_records = _local_score_records_from_logits(
+            logits=logits,
+            labels=prepared_micro.model_labels,
+            token_uids=prepared_micro.local_token_uids,
+            desired_uids=set(logical_uids),
+        )
+    gathered_records: list[dict[int, ScoreRecord]] = [
+        {} for _ in range(dist_any.get_world_size())
+    ]
+    dist_any.all_gather_object(gathered_records, local_records)
+    return _score_bundle_from_records(
+        records=_merge_score_records(gathered_records),
+        logical_tokens=logical_tokens,
+        logical_uids=logical_uids,
+        side=side,
+        weight_state=weight_state,
+        rollout_mode=rollout_mode,
+    )
+
+
+def score_context_parallel_runtime(
+    *,
+    runtime: Any,
+    packed_tensors: dict[str, Any],
+    logical_map: LogicalTokenMap,
+    weight_state: WeightState,
+    rollout_mode: RolloutMode | None = "native_lora",
+    global_grad_accumulation_sequences: int,
+) -> ScoreBundle:
+    from art.megatron.training.microbatches import (
+        _clone_packed_tensors,
+        _zero_contribution_inputs,
+        build_micro_sample_indices,
+        select_indexed_inputs,
+        select_micro_inputs,
+    )
+
+    controller = runtime.moe_routing_replay_controller
+    target_logprobs: list[float] = []
+    topk: list[TokenTopK] = []
+    tokens_by_sample: dict[int, list[LogicalToken]] = {}
+    for token in logical_map.tokens:
+        tokens_by_sample.setdefault(token.sample_id, []).append(token)
+    num_sequences = int(packed_tensors["tokens"].shape[0])
+    template = _clone_packed_tensors(
+        select_indexed_inputs(cast(Any, packed_tensors), 0)
+    )
+    zero_template = _zero_contribution_inputs(template)
+    num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
+    for step_index in range(num_steps):
+        micro_indices = build_micro_sample_indices(
+            step_index=step_index,
+            num_sequences=num_sequences,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+        micro_inputs = select_micro_inputs(
+            cast(Any, packed_tensors),
+            micro_indices,
+            zero_template,
+        )
+        if controller is not None:
+            controller.set_step(
+                step_index=step_index,
+                sample_index=micro_indices,
+                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+            )
+        for micro_order, (sample_index, micro_input) in enumerate(
+            zip(micro_indices, micro_inputs, strict=True)
+        ):
+            if controller is not None:
+                controller.begin_micro(sample_index, micro_order)
+            sample_score = _score_context_parallel_once(
+                runtime=runtime,
+                packed_tensors=cast(dict[str, Any], micro_input),
+                logical_tokens=(
+                    []
+                    if sample_index is None
+                    else tokens_by_sample.get(sample_index, [])
+                ),
+                sample_id_to_row=({} if sample_index is None else {sample_index: 0}),
+                side="megatron",
+                weight_state=weight_state,
+                rollout_mode=rollout_mode,
+            )
+            target_logprobs.extend(sample_score.target_logprobs)
+            topk.extend(sample_score.topk)
+        if controller is not None:
+            controller.finalize_step()
+    return ScoreBundle(
+        side="megatron",
+        weight_state=weight_state,
+        rollout_mode=rollout_mode,
+        target_logprobs=target_logprobs,
+        topk=topk,
+    )
 
 
 def _extract_scores_from_logits(
@@ -803,586 +1360,3 @@ def _extract_scores_from_logits(
         target_logprobs=target_logprobs,
         topk=topk,
     )
-
-
-def _megatron_worker(request: MegatronWorkerRequest) -> None:
-    import torch
-
-    from art.megatron import train as megatron_train
-    from art.megatron.weights.merge import load_lora_adapter_state_dict
-
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(backend="nccl")  # type: ignore[possibly-missing-attribute]
-    _set_seed(request.config.seed)
-    os.environ.update(request.config.topology.env())
-
-    runtime = megatron_train.build_training_runtime(
-        model_identifier=request.config.base_model,
-        provider_torch_dtype=torch.bfloat16,
-        provider_bundle_configure=(
-            lambda bundle: (
-                _configure_lora_target_modules(
-                    bundle,
-                    _lora_target_modules(request.config),
-                )
-                if request.config.lora_target_modules is not None
-                else None
-            )
-        ),
-        provider_configure=lambda provider: _configure_provider(
-            provider, request.config
-        ),
-        print_env=False,
-        build_optimizer=False,
-        # This worker only runs forward passes. Use the LoRA trainable path for
-        # both base and LoRA scoring so Megatron freezes base weights before DDP
-        # allocates buffers; base scoring simply does not load a nonzero adapter.
-        trainable_parameter_mode="lora",
-        allow_unvalidated_arch=request.config.allow_unvalidated_arch,
-    )
-    for chunk in runtime.model:
-        chunk.eval()
-
-    artifact_dir = Path(request.artifact_dir)
-    packed_tensors = _build_packed_tensors(request.config)
-    logical_map = build_logical_token_map(packed_tensors)
-
-    adapter_path: Path | None = None
-    if request.weight_state == "lora":
-        if request.adapter_path is None:
-            initial_state = _collect_full_lora_state(cast(list[Any], runtime.model))
-            if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
-                adapter_path = artifact_dir / "active_lora"
-                initialized = _build_deterministic_nonzero_lora(
-                    initial_state or {},
-                    seed=request.config.seed,
-                )
-                _save_vllm_lora_adapter(
-                    lora_path=adapter_path,
-                    state=initialized,
-                    runtime=runtime,
-                    config=request.config,
-                )
-            torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
-            adapter_path = artifact_dir / "active_lora"
-        else:
-            adapter_path = Path(request.adapter_path)
-        adapter_model = load_lora_adapter_state_dict(
-            str(adapter_path),
-            handler=runtime.model_support_handler,
-            allow_unvalidated_arch=request.config.allow_unvalidated_arch,
-        )
-        megatron_train.load_adapter_into_model(runtime.model, adapter_model)
-
-    logits = _run_logits(runtime=runtime, packed_tensors=packed_tensors)
-    score = _extract_scores_from_logits(
-        logits=logits,
-        logical_map=logical_map,
-        side="megatron",
-        weight_state=request.weight_state,
-    )
-
-    if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
-        score_path = artifact_dir / f"megatron_{request.weight_state}_scores.json"
-        logical_map_path = artifact_dir / "logical_token_map.json"
-        _write_json(score_path, score.model_dump(mode="json"))
-        _write_json(logical_map_path, logical_map.model_dump(mode="json"))
-        result = MegatronWorkerResult(
-            score_path=str(score_path),
-            logical_map_path=str(logical_map_path),
-            adapter_path=str(adapter_path) if adapter_path is not None else None,
-        )
-        _write_json(
-            artifact_dir / f"megatron_{request.weight_state}_worker_result.json",
-            result.model_dump(mode="json"),
-        )
-    torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
-    torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
-
-
-def _run_megatron_worker(request: MegatronWorkerRequest) -> MegatronWorkerResult:
-    artifact_dir = Path(request.artifact_dir)
-    request_path = artifact_dir / f"megatron_{request.weight_state}_request.json"
-    _write_json(request_path, request.model_dump(mode="json"))
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(
-        str(value) for value in request.config.trainer_gpu_ids
-    )
-    env["PYTHONUNBUFFERED"] = "1"
-    tests_dir = str(REPO_ROOT / "tests")
-    env["PYTHONPATH"] = (
-        tests_dir
-        if not env.get("PYTHONPATH")
-        else f"{tests_dir}{os.pathsep}{env['PYTHONPATH']}"
-    )
-    command = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nproc_per_node",
-        str(request.config.topology.world_size()),
-        "-m",
-        "integration.megatron.train_inf_mismatch.output_parity",
-        "--worker",
-        "--request",
-        str(request_path),
-    ]
-    log_path = artifact_dir / f"megatron_{request.weight_state}_worker.log"
-    with log_path.open("w", encoding="utf-8") as log_file:
-        run = subprocess.run(
-            command,
-            cwd=str(REPO_ROOT / "tests"),
-            env=env,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-    if run.returncode != 0:
-        tail = "\n".join(log_path.read_text(encoding="utf-8").splitlines()[-120:])
-        raise RuntimeError(
-            f"Megatron {request.weight_state} worker failed with exit code "
-            f"{run.returncode}.\n{tail}"
-        )
-    return MegatronWorkerResult.model_validate(
-        _read_json(artifact_dir / f"megatron_{request.weight_state}_worker_result.json")
-    )
-
-
-@asynccontextmanager
-async def _direct_vllm_runtime(
-    *,
-    config: TrainInfOutputParityConfig,
-    artifact_dir: Path,
-    served_model_name: str,
-    lora_path: str,
-    rollout_weights_mode: Literal["lora", "merged"],
-    engine_args: dict[str, Any],
-) -> AsyncIterator[tuple[str, int]]:
-    import art.vllm_runtime as runtime
-
-    port = _free_port()
-    launch_config = runtime.VllmRuntimeLaunchConfig(
-        base_model=config.base_model,
-        port=port,
-        host="127.0.0.1",
-        cuda_visible_devices=",".join(str(value) for value in config.inference_gpu_ids),
-        lora_path=lora_path,
-        served_model_name=served_model_name,
-        rollout_weights_mode=rollout_weights_mode,
-        engine_args=engine_args,
-        server_args={
-            "return_tokens_as_token_ids": True,
-            **config.server_args,
-        },
-    )
-    command = runtime.build_vllm_runtime_server_cmd(launch_config)
-    log_path = artifact_dir / f"vllm_{served_model_name}.log"
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    with log_path.open("w", encoding="utf-8") as log_file:
-        process = subprocess.Popen(
-            command,
-            cwd=str(runtime.get_vllm_runtime_working_dir()),
-            env=env,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-    try:
-        await runtime.wait_for_vllm_runtime(
-            process=process,
-            host=launch_config.host,
-            port=launch_config.port,
-            timeout=float(
-                os.environ.get("ART_TRAIN_INF_MISMATCH_VLLM_TIMEOUT", "1200")
-            ),
-        )
-        yield launch_config.host, launch_config.port
-    finally:
-        process.terminate()
-        try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=30)
-
-
-async def _request_prompt_logprobs(
-    *,
-    base_url: str,
-    model_name: str,
-    prompt_token_ids: list[int],
-) -> dict[str, Any]:
-    import httpx
-
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(
-            f"{base_url}/v1/completions",
-            json={
-                "model": model_name,
-                "prompt": prompt_token_ids,
-                "add_special_tokens": False,
-                "max_tokens": 0,
-                "echo": True,
-                "prompt_logprobs": TOP_K,
-                "return_token_ids": True,
-            },
-        )
-        response.raise_for_status()
-        return response.json()
-
-
-def _logprob_entry_value(entry: dict[str, Any], token_id: int) -> float:
-    raw = entry.get(str(token_id))
-    if raw is None:
-        raise RuntimeError(f"Token {token_id} missing from vLLM prompt_logprobs entry")
-    if isinstance(raw, dict):
-        return float(raw["logprob"])
-    return float(raw.logprob)
-
-
-def _topk_from_entry(entry: dict[str, Any]) -> TokenTopK:
-    parsed: list[tuple[int, int, float]] = []
-    for raw_token_id, raw_value in entry.items():
-        token_id = int(raw_token_id)
-        if isinstance(raw_value, dict):
-            rank = int(raw_value.get("rank", TOP_K + 1))
-            logprob = float(raw_value["logprob"])
-        else:
-            rank = int(raw_value.rank)
-            logprob = float(raw_value.logprob)
-        if 1 <= rank <= TOP_K:
-            parsed.append((rank, token_id, logprob))
-    parsed.sort(key=lambda item: item[0])
-    return TokenTopK(
-        token_ids=[token_id for _rank, token_id, _logprob in parsed[:TOP_K]],
-        logprobs=[logprob for _rank, _token_id, logprob in parsed[:TOP_K]],
-    )
-
-
-async def _score_vllm_at_url(
-    *,
-    base_url: str,
-    model_name: str,
-    logical_map: LogicalTokenMap,
-    weight_state: WeightState,
-    rollout_mode: RolloutMode,
-    artifact_dir: Path,
-) -> ScoreBundle:
-    responses_by_prompt: dict[int, dict[str, Any]] = {}
-    prompt_by_id = {prompt.prompt_id: prompt for prompt in logical_map.prompts}
-    for prompt in logical_map.prompts:
-        response = await _request_prompt_logprobs(
-            base_url=base_url,
-            model_name=model_name,
-            prompt_token_ids=prompt.token_ids,
-        )
-        choice = response["choices"][0]
-        returned_prompt_ids = [int(value) for value in choice["prompt_token_ids"]]
-        if returned_prompt_ids != prompt.token_ids:
-            raise RuntimeError(
-                "vLLM returned prompt_token_ids do not match request for "
-                f"prompt_id={prompt.prompt_id}"
-            )
-        responses_by_prompt[prompt.prompt_id] = response
-    _write_json(
-        artifact_dir / f"vllm_{rollout_mode}_{weight_state}_responses.json",
-        responses_by_prompt,
-    )
-
-    target_logprobs: list[float] = []
-    topk: list[TokenTopK] = []
-    for token in logical_map.tokens:
-        prompt = prompt_by_id[token.prompt_id]
-        choice = responses_by_prompt[token.prompt_id]["choices"][0]
-        entries = choice["prompt_logprobs"]
-        returned_token_id = int(prompt.token_ids[token.vllm_prompt_token_index])
-        if returned_token_id != token.token_id:
-            raise RuntimeError(
-                "Logical token alignment mismatch: "
-                f"expected={token.token_id} returned={returned_token_id}"
-            )
-        entry = entries[token.vllm_prompt_token_index]
-        if entry is None:
-            raise RuntimeError(
-                f"Missing prompt logprob entry for prompt_id={token.prompt_id} "
-                f"index={token.vllm_prompt_token_index}"
-            )
-        target_logprobs.append(_logprob_entry_value(entry, token.token_id))
-        topk.append(_topk_from_entry(entry))
-    return ScoreBundle(
-        side="vllm",
-        weight_state=weight_state,
-        rollout_mode=rollout_mode,
-        target_logprobs=target_logprobs,
-        topk=topk,
-    )
-
-
-async def _score_vllm_base(
-    *,
-    config: TrainInfOutputParityConfig,
-    rollout_mode: RolloutMode,
-    logical_map: LogicalTokenMap,
-    artifact_dir: Path,
-) -> ScoreBundle:
-    served_name = f"train_inf_base_{rollout_mode}_{int(time.time())}"
-    placeholder_lora = artifact_dir / "unused_lora_placeholder"
-    placeholder_lora.mkdir(exist_ok=True)
-    engine_args = {
-        "tensor_parallel_size": len(config.inference_gpu_ids),
-        "enable_expert_parallel": len(config.inference_gpu_ids) > 1,
-        "max_model_len": config.packed.sequence_length + 8,
-        **config.engine_args,
-    }
-    if rollout_mode == "native_lora":
-        engine_args["enable_lora"] = True
-        engine_args["lora_target_modules"] = _lora_target_modules(config)
-    async with _direct_vllm_runtime(
-        config=config,
-        artifact_dir=artifact_dir,
-        served_model_name=served_name,
-        lora_path=str(placeholder_lora),
-        rollout_weights_mode="merged",
-        engine_args=engine_args,
-    ) as (host, port):
-        return await _score_vllm_at_url(
-            base_url=f"http://{host}:{port}",
-            model_name=served_name,
-            logical_map=logical_map,
-            weight_state="base",
-            rollout_mode=rollout_mode,
-            artifact_dir=artifact_dir,
-        )
-
-
-async def _score_vllm_native_lora(
-    *,
-    config: TrainInfOutputParityConfig,
-    adapter_path: str,
-    logical_map: LogicalTokenMap,
-    artifact_dir: Path,
-) -> ScoreBundle:
-    served_name = f"train_inf_native_lora_{int(time.time())}"
-    engine_args = {
-        "tensor_parallel_size": len(config.inference_gpu_ids),
-        "enable_expert_parallel": len(config.inference_gpu_ids) > 1,
-        "max_model_len": config.packed.sequence_length + 8,
-        **config.engine_args,
-    }
-    engine_args["lora_target_modules"] = _lora_target_modules(config)
-    async with _direct_vllm_runtime(
-        config=config,
-        artifact_dir=artifact_dir,
-        served_model_name=served_name,
-        lora_path=adapter_path,
-        rollout_weights_mode="lora",
-        engine_args=engine_args,
-    ) as (host, port):
-        return await _score_vllm_at_url(
-            base_url=f"http://{host}:{port}",
-            model_name=served_name,
-            logical_map=logical_map,
-            weight_state="lora",
-            rollout_mode="native_lora",
-            artifact_dir=artifact_dir,
-        )
-
-
-async def _score_vllm_merged_lora(
-    *,
-    config: TrainInfOutputParityConfig,
-    adapter_path: str,
-    logical_map: LogicalTokenMap,
-    artifact_dir: Path,
-) -> ScoreBundle:
-    from art import dev
-    from art.megatron.service import MegatronService
-
-    service_name = f"train_inf_merged_lora_{int(time.time())}"
-    output_dir = artifact_dir / "merged_service"
-    from art.utils.output_dirs import get_step_checkpoint_dir
-
-    checkpoint_dir = Path(get_step_checkpoint_dir(str(output_dir), 0))
-    checkpoint_dir.mkdir(parents=True)
-    for filename in ("adapter_model.safetensors", "adapter_config.json"):
-        shutil.copy(Path(adapter_path) / filename, checkpoint_dir / filename)
-    internal_config = dev.InternalModelConfig(
-        trainer_gpu_ids=config.trainer_gpu_ids,
-        inference_gpu_ids=config.inference_gpu_ids,
-        rollout_weights_mode="merged",
-        allow_unvalidated_arch=config.allow_unvalidated_arch,
-        engine_args={
-            "tensor_parallel_size": len(config.inference_gpu_ids),
-            "enable_expert_parallel": len(config.inference_gpu_ids) > 1,
-            "max_model_len": config.packed.sequence_length + 8,
-            **config.engine_args,
-        },
-    )
-    with _provider_topology_env(config.topology):
-        service = MegatronService(
-            model_name=service_name,
-            base_model=config.base_model,
-            config=internal_config,
-            output_dir=str(output_dir),
-        )
-        try:
-            host, port = await service.start_openai_server(
-                {"server_args": {"port": _free_port(), **config.server_args}}
-            )
-            return await _score_vllm_at_url(
-                base_url=f"http://{host}:{port}",
-                model_name=f"{service_name}@0",
-                logical_map=logical_map,
-                weight_state="lora",
-                rollout_mode="merged",
-                artifact_dir=artifact_dir,
-            )
-        finally:
-            await service.aclose()
-
-
-def _assert_lora_active(
-    base: ScoreBundle, lora: ScoreBundle, *, side: EngineSide
-) -> None:
-    import torch
-
-    base_values = torch.tensor(base.target_logprobs, dtype=torch.float32)
-    lora_values = torch.tensor(lora.target_logprobs, dtype=torch.float32)
-    if not bool(torch.isfinite(base_values).all().item()):
-        raise RuntimeError(f"{side} base target logprobs contain non-finite values")
-    if not bool(torch.isfinite(lora_values).all().item()):
-        raise RuntimeError(f"{side} LoRA target logprobs contain non-finite values")
-    if int(torch.count_nonzero((lora_values - base_values).abs() > 0).item()) == 0:
-        raise RuntimeError(f"{side} LoRA is not active: all deltas are zero")
-
-
-async def run_train_inf_output_parity(
-    *,
-    config: TrainInfOutputParityConfig,
-    artifact_dir: Path,
-) -> TrainInfOutputParityReport:
-    _write_json(artifact_dir / "probe_config.json", config.model_dump(mode="json"))
-    lora_result = _run_megatron_worker(
-        MegatronWorkerRequest(
-            config=config,
-            artifact_dir=str(artifact_dir),
-            weight_state="lora",
-            adapter_path=None,
-        )
-    )
-    if lora_result.adapter_path is None:
-        raise RuntimeError("LoRA worker did not produce an adapter")
-    base_result = _run_megatron_worker(
-        MegatronWorkerRequest(
-            config=config,
-            artifact_dir=str(artifact_dir),
-            weight_state="base",
-            adapter_path=None,
-        )
-    )
-    logical_map = LogicalTokenMap.model_validate(
-        _read_json(Path(lora_result.logical_map_path))
-    )
-    base_logical_map = LogicalTokenMap.model_validate(
-        _read_json(Path(base_result.logical_map_path))
-    )
-    if base_logical_map != logical_map:
-        raise RuntimeError("Base and LoRA Megatron workers produced different maps")
-
-    megatron_base = ScoreBundle.model_validate(_read_json(Path(base_result.score_path)))
-    megatron_lora = ScoreBundle.model_validate(_read_json(Path(lora_result.score_path)))
-    _assert_lora_active(megatron_base, megatron_lora, side="megatron")
-
-    rollout_comparisons: list[RolloutComparison] = []
-    for rollout_mode in config.rollout_modes:
-        vllm_base = await _score_vllm_base(
-            config=config,
-            rollout_mode=rollout_mode,
-            logical_map=logical_map,
-            artifact_dir=artifact_dir,
-        )
-        if rollout_mode == "native_lora":
-            vllm_lora = await _score_vllm_native_lora(
-                config=config,
-                adapter_path=lora_result.adapter_path,
-                logical_map=logical_map,
-                artifact_dir=artifact_dir,
-            )
-        else:
-            vllm_lora = await _score_vllm_merged_lora(
-                config=config,
-                adapter_path=lora_result.adapter_path,
-                logical_map=logical_map,
-                artifact_dir=artifact_dir,
-            )
-        _assert_lora_active(vllm_base, vllm_lora, side="vllm")
-        _write_json(
-            artifact_dir / f"vllm_{rollout_mode}_base_scores.json",
-            vllm_base.model_dump(mode="json"),
-        )
-        _write_json(
-            artifact_dir / f"vllm_{rollout_mode}_lora_scores.json",
-            vllm_lora.model_dump(mode="json"),
-        )
-        rollout_comparisons.append(
-            compare_rollout(
-                rollout_mode=rollout_mode,
-                megatron_base=megatron_base,
-                megatron_lora=megatron_lora,
-                vllm_base=vllm_base,
-                vllm_lora=vllm_lora,
-                logical_map=logical_map,
-            )
-        )
-
-    passed = all(
-        comparison.base.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
-        and comparison.lora.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
-        for comparison in rollout_comparisons
-    )
-    report = TrainInfOutputParityReport(
-        base_model=config.base_model,
-        artifact_dir=str(artifact_dir),
-        topology=config.topology.slug(),
-        trainer_gpu_ids=config.trainer_gpu_ids,
-        inference_gpu_ids=config.inference_gpu_ids,
-        logical_prompt_count=len(logical_map.prompts),
-        logical_token_count=len(logical_map.tokens),
-        adapter_path=lora_result.adapter_path,
-        megatron_base_scores=base_result.score_path,
-        megatron_lora_scores=lora_result.score_path,
-        rollout_comparisons=rollout_comparisons,
-        passed=passed,
-    )
-    _write_json(artifact_dir / "comparison_report.json", report.model_dump(mode="json"))
-    return report
-
-
-def _worker_cli(request_path: Path) -> None:
-    request = MegatronWorkerRequest.model_validate(_read_json(request_path))
-    _megatron_worker(request)
-
-
-def _parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--worker", action="store_true")
-    parser.add_argument("--request", type=Path)
-    return parser.parse_args(argv)
-
-
-def _main(argv: list[str]) -> int:
-    args = _parse_args(argv)
-    if args.worker:
-        if args.request is None:
-            raise ValueError("--worker requires --request")
-        _worker_cli(args.request)
-        return 0
-    raise ValueError("This module is intended to be run through pytest or --worker")
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main(sys.argv[1:]))

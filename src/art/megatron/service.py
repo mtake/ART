@@ -1,14 +1,15 @@
 import asyncio
 from dataclasses import dataclass, field
-import gc
 import importlib
+import json
 import os
 from pathlib import Path
 import shutil
 import socket
-import subprocess
 import sys
 from typing import Any, AsyncIterator, Literal, TypedDict, cast
+from urllib.parse import urlparse
+import warnings
 
 from peft.tuners.lora.config import LoraConfig
 import torch
@@ -19,25 +20,34 @@ from ..dev.validate import is_dedicated_mode
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
-from ..utils.convert_moe_lora import convert_checkpoint_if_needed
+from ..types import MegatronRuntimeConfig, MegatronTopologyConfig
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.lifecycle import (
     ChildProcessSupervisor,
     ServiceLifecycle,
     managed_process_cmd,
     terminate_asyncio_process_group,
-    terminate_popen_process_group,
 )
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
+    ManagedVllmRuntime,
     VllmRuntimeLaunchConfig,
-    build_vllm_runtime_server_cmd,
-    get_vllm_runtime_nccl_so_path,
-    get_vllm_runtime_working_dir,
-    wait_for_vllm_runtime,
+    get_external_vllm_runtime_config,
+    map_checkpoint_path_for_vllm,
+    normalize_vllm_server_url,
+    wait_for_vllm_http_runtime,
 )
-from .lora import LORA_ALPHA, default_lora_rank_for_handler
+from .lora import (
+    LORA_ALPHA,
+    MEGATRON_LORA_RANK_ENV,
+    MEGATRON_LORA_TARGET_MODULES_ENV,
+    default_lora_rank_for_handler,
+)
 from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
+from .model_support.registry import (
+    UnsupportedModelArchitectureError,
+    model_uses_expert_parallel,
+)
 from .runtime.client import (
     create_megatron_job_paths,
     stream_megatron_job,
@@ -51,36 +61,37 @@ from .runtime.jobs import (
     MergedWeightTransferInitInfo,
     MergedWeightTransferSpec,
 )
+from .runtime_config import get_megatron_runtime_config
 from .training.sft_batches import materialize_sft_batches
 
 safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
-
-
-def gc_and_empty_cuda_cache(n: int = 3) -> None:
-    for _ in range(n):
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+OFFLOAD_BETWEEN_JOBS_ENV = "ART_MEGATRON_OFFLOAD_BETWEEN_JOBS"
 
 
 class _RuntimeRequestKwargs(TypedDict, total=False):
     headers: dict[str, str]
 
 
+def _lora_config_from_model_config(
+    config: dev.InternalModelConfig | dev.BackendModelConfig,
+) -> dev.LoRAConfig:
+    return cast(dev.BackendModelConfig, config).get("lora_config") or dev.LoRAConfig()
+
+
 def create_identity_lora(
     base_model: str,
     lora_path: str,
     rank: int | None = None,
+    target_modules: list[str] | None = None,
     lora_alpha: int = LORA_ALPHA,
     random_state: int | None = None,
     allow_unvalidated_arch: bool = False,
 ) -> None:
     """Create an identity LoRA adapter for a Megatron model.
 
-    For MoE models, this targets fused expert parameters and converts them to
-    per-expert format. The conversion swaps lora_A/lora_B, producing A=zeros and
-    B=Kaiming — which is critical for stable training when alpha/rank is large.
+    For MoE models, this targets fused expert parameters and lets the model
+    support handler normalize the saved PEFT tensors to vLLM layout.
 
     Args:
         base_model: HuggingFace model identifier.
@@ -98,7 +109,7 @@ def create_identity_lora(
 
     if random_state is not None:
         torch.manual_seed(random_state)
-    target_modules = default_target_modules(base_model)
+    target_modules = target_modules or default_target_modules(base_model)
     handler = get_model_support_handler(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -109,7 +120,7 @@ def create_identity_lora(
     model_config = handler.identity_lora_model_config(base_config)
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
-            model_config, torch_dtype=torch.bfloat16, trust_remote_code=True
+            model_config, dtype=torch.bfloat16, trust_remote_code=True
         )
     model.name_or_path = base_model
 
@@ -136,12 +147,24 @@ def create_identity_lora(
             return module
         return orig_to(module, *args, **kwargs)
 
-    with patch.object(torch.nn.Module, "to", _skip_meta_to):
-        peft_model = get_peft_model(model, lora_config)
+    # PEFT does not recognize fused MoE expert modules, but our handler
+    # converts the resulting identity LoRA checkpoint into supported tensors.
+    with warnings.catch_warnings():
+        if bool(getattr(handler, "is_moe", False)):
+            warnings.filterwarnings(
+                "ignore",
+                message=(
+                    r"Unsupported layer type '.*MoeExperts.*' encountered, "
+                    r"proceed at your own risk\."
+                ),
+                category=UserWarning,
+                module=r"peft\.tuners\.tuners_utils",
+            )
+        with patch.object(torch.nn.Module, "to", _skip_meta_to):
+            peft_model = get_peft_model(model, lora_config)
 
     os.makedirs(lora_path, exist_ok=True)
     peft_model.save_pretrained(lora_path)
-    convert_checkpoint_if_needed(lora_path)
 
     final_config = LoraConfig(
         base_model_name_or_path=base_model,
@@ -165,21 +188,24 @@ def create_identity_lora(
 class MegatronService:
     model_name: str
     base_model: str
-    config: dev.InternalModelConfig
+    config: dev.InternalModelConfig | dev.BackendModelConfig
     output_dir: str
+    enable_expert_replay: bool = True
+    runtime_config: MegatronRuntimeConfig = field(
+        default_factory=get_megatron_runtime_config
+    )
     _is_sleeping: bool = False
     _latest_step: int = 0
     _megatron_process: asyncio.subprocess.Process | None = None
     _megatron_log_file: Any = None
     _megatron_log_path: str | None = None
-    _vllm_process: subprocess.Popen[Any] | None = None
-    _vllm_log_file: Any = None
-    _vllm_log_path: str | None = None
-    _vllm_host: str = "127.0.0.1"
-    _vllm_port: int = 0
-    _vllm_api_key: str | None = None
-    _vllm_nccl_so_path: str | None = None
+    _vllm_runtime: ManagedVllmRuntime = field(
+        default_factory=ManagedVllmRuntime,
+        init=False,
+        repr=False,
+    )
     _merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
+    _active_megatron_topology: MegatronTopologyConfig | None = None
     _lifecycle: ServiceLifecycle = field(
         default_factory=ServiceLifecycle,
         init=False,
@@ -202,6 +228,13 @@ class MegatronService:
     def _raise_if_child_failed(self) -> None:
         self._child_processes.raise_if_failed()
 
+    def _status(self, message: str) -> None:
+        print(f"[ART Megatron] {message}", flush=True)
+
+    @staticmethod
+    def _display_path(path: str | os.PathLike[str]) -> str:
+        return str(Path(path).resolve())
+
     @property
     def is_dedicated(self) -> bool:
         return is_dedicated_mode(self.config)
@@ -214,7 +247,37 @@ class MegatronService:
 
     @property
     def _vllm_base_url(self) -> str:
-        return f"http://{self._vllm_host}:{self._vllm_port}"
+        if external_runtime := get_external_vllm_runtime_config(self.config):
+            return normalize_vllm_server_url(external_runtime.server_url)
+        return self._vllm_runtime.base_url
+
+    @property
+    def _vllm_host(self) -> str:
+        if external_runtime := get_external_vllm_runtime_config(self.config):
+            parsed = urlparse(normalize_vllm_server_url(external_runtime.server_url))
+            return parsed.hostname or self._vllm_runtime.host
+        return self._vllm_runtime.host
+
+    @property
+    def _vllm_port(self) -> int:
+        if external_runtime := get_external_vllm_runtime_config(self.config):
+            parsed = urlparse(normalize_vllm_server_url(external_runtime.server_url))
+            return parsed.port or (443 if parsed.scheme == "https" else 80)
+        return self._vllm_runtime.port
+
+    @_vllm_port.setter
+    def _vllm_port(self, port: int) -> None:
+        self._vllm_runtime.port = port
+
+    @property
+    def _vllm_api_key(self) -> str | None:
+        if external_runtime := get_external_vllm_runtime_config(self.config):
+            return external_runtime.api_key
+        return self._vllm_runtime.api_key
+
+    @property
+    def _vllm_nccl_so_path(self) -> str | None:
+        return self._vllm_runtime.nccl_so_path
 
     def _megatron_random_state(self) -> int | None:
         for config_key in ("peft_args", "init_args"):
@@ -226,6 +289,48 @@ class MegatronService:
     @property
     def _allow_unvalidated_arch(self) -> bool:
         return bool(self.config.get("allow_unvalidated_arch", False))
+
+    def _model_uses_expert_replay(self) -> bool:
+        if not self.enable_expert_replay:
+            return False
+        try:
+            return model_uses_expert_parallel(
+                self.base_model,
+                allow_unvalidated_arch=self._allow_unvalidated_arch,
+            )
+        except UnsupportedModelArchitectureError:
+            return False
+
+    def _trainer_gpu_count(self) -> int:
+        if self.is_dedicated:
+            return len(self.config["trainer_gpu_ids"])
+        return max(int(torch.cuda.device_count()), 1)
+
+    @staticmethod
+    def _parallel_env_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        return default if raw is None or raw == "" else int(raw)
+
+    def _data_parallel_world_size(self) -> int:
+        num_gpus = self._trainer_gpu_count()
+        tp = self._parallel_env_int("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", num_gpus)
+        cp = self._parallel_env_int("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", 1)
+        pp = self._parallel_env_int("ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE", 1)
+        denominator = max(tp * cp * pp, 1)
+        if num_gpus % denominator != 0:
+            raise RuntimeError(
+                "Cannot resolve Megatron data-parallel world size from trainer "
+                f"GPUs/topology: num_gpus={num_gpus}, tp={tp}, cp={cp}, pp={pp}"
+            )
+        return max(num_gpus // denominator, 1)
+
+    async def resolve_global_grad_accumulation_sequences(
+        self,
+        config: types.TrainConfig,
+    ) -> int:
+        if config.grad_accumulation_sequences is not None:
+            return int(config.grad_accumulation_sequences)
+        return self._data_parallel_world_size()
 
     def _megatron_runtime_paths(self) -> tuple[str, str, str]:
         runtime_dir = Path(self.output_dir) / "megatron_runtime"
@@ -261,6 +366,30 @@ class MegatronService:
             sock.bind(("", 0))
             return int(sock.getsockname()[1])
 
+    @staticmethod
+    def _megatron_topology_env(topology: MegatronTopologyConfig) -> dict[str, str]:
+        env = {
+            "ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE": str(topology.tp),
+            "ART_MEGATRON_CONTEXT_PARALLEL_SIZE": str(topology.cp),
+            "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE": str(topology.ep),
+            "ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE": str(topology.pp),
+            "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE": str(topology.etp),
+        }
+        if topology.vpp is not None:
+            env["ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE"] = str(topology.vpp)
+        return env
+
+    @staticmethod
+    def _megatron_topology_env_names() -> tuple[str, ...]:
+        return (
+            "ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE",
+            "ART_MEGATRON_CONTEXT_PARALLEL_SIZE",
+            "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE",
+            "ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE",
+            "ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE",
+            "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE",
+        )
+
     def _install_parent_signal_cleanup(self) -> None:
         self._lifecycle.install_parent_cleanup(self.close)
 
@@ -277,9 +406,19 @@ class MegatronService:
     def _runtime_engine_args(
         self, config: dev.OpenAIServerConfig | None
     ) -> dict[str, object]:
+        from .model_support import get_model_support_handler
+
         engine_args = dict(self.config.get("engine_args", {}))
         if config and "engine_args" in config:
             engine_args.update(dict(config["engine_args"]))
+        handler = get_model_support_handler(
+            self.base_model,
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
+        )
+        for key, value in handler.vllm_engine_args(
+            rollout_weights_mode=self.rollout_weights_mode
+        ).items():
+            engine_args.setdefault(key, value)
         engine_args.setdefault("generation_config", "vllm")
         if self.rollout_weights_mode == "merged":
             engine_args["weight_transfer_config"] = {"backend": "nccl"}
@@ -295,11 +434,18 @@ class MegatronService:
     def _runtime_server_args(
         self, config: dev.OpenAIServerConfig | None
     ) -> dict[str, object]:
+        from .model_support import get_model_support_handler
+
         server_args: dict[str, object] = {
             "return_tokens_as_token_ids": True,
             "enable_auto_tool_choice": True,
             "tool_call_parser": "hermes",
         }
+        handler = get_model_support_handler(
+            self.base_model,
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
+        )
+        server_args.update(handler.vllm_server_args())
         if config and "server_args" in config:
             server_args.update(dict(config["server_args"]))
         for key in ("port", "host", "lora_modules"):
@@ -314,6 +460,9 @@ class MegatronService:
     def _runtime_request_kwargs(self) -> _RuntimeRequestKwargs:
         headers = self._runtime_headers()
         return {"headers": headers} if headers else {}
+
+    def _vllm_checkpoint_path(self, checkpoint_path: str) -> str:
+        return map_checkpoint_path_for_vllm(self.config, checkpoint_path)
 
     def _sleep_mode_enabled(self) -> bool:
         return bool(self.config.get("engine_args", {}).get("enable_sleep_mode", True))
@@ -332,11 +481,16 @@ class MegatronService:
             self.base_model,
             allow_unvalidated_arch=self._allow_unvalidated_arch,
         )
+        lora_config = _lora_config_from_model_config(self.config)
+        rank = int(lora_config.get("rank", default_lora_rank_for_handler(handler)))
+        target_modules = lora_config.get("target_modules") or default_target_modules(
+            self.base_model
+        )
         return LoraConfig(
             base_model_name_or_path=self.base_model,
-            r=default_lora_rank_for_handler(handler),
+            r=rank,
             lora_alpha=LORA_ALPHA,
-            target_modules=default_target_modules(self.base_model),
+            target_modules=target_modules,
             bias="none",
         )
 
@@ -353,9 +507,17 @@ class MegatronService:
         return True
 
     def _create_identity_lora(self, lora_path: str) -> None:
+        self._status(
+            "Preparing initial LoRA adapter "
+            f"for {self.base_model} at {self._display_path(lora_path)}"
+        )
+        lora_config = _lora_config_from_model_config(self.config)
+        rank = lora_config.get("rank")
         create_identity_lora(
             self.base_model,
             lora_path,
+            rank=int(rank) if rank is not None else None,
+            target_modules=lora_config.get("target_modules"),
             random_state=self._megatron_random_state(),
             allow_unvalidated_arch=self._allow_unvalidated_arch,
         )
@@ -444,91 +606,32 @@ class MegatronService:
         port: int,
         config: dev.OpenAIServerConfig | None,
     ) -> tuple[str, int]:
-        import httpx
-
         self._raise_if_child_failed()
         server_args = self._runtime_server_args(config)
-        api_key = server_args.get("api_key")
-        self._vllm_api_key = api_key if isinstance(api_key, str) else None
-        self._vllm_nccl_so_path = (
-            str(get_vllm_runtime_nccl_so_path())
-            if self.rollout_weights_mode == "merged"
-            else None
+        vllm_log_path = Path(self.output_dir) / "logs" / "vllm-runtime.log"
+        self._status(
+            "Starting vLLM runtime "
+            f"for {self.base_model}. Logs: {self._display_path(vllm_log_path)}"
         )
-        cmd = build_vllm_runtime_server_cmd(
-            VllmRuntimeLaunchConfig(
+        location = await self._vllm_runtime.start(
+            launch_config=VllmRuntimeLaunchConfig(
                 base_model=self.base_model,
                 port=port,
-                host=self._vllm_host,
+                host=self._vllm_runtime.host,
                 cuda_visible_devices=self._runtime_cuda_visible_devices(),
                 lora_path=lora_path,
                 served_model_name=f"{self.model_name}@{self._latest_step}",
                 rollout_weights_mode=self.rollout_weights_mode,
                 engine_args=self._runtime_engine_args(config),
                 server_args=server_args,
-            )
+            ),
+            output_dir=self.output_dir,
+            child_processes=self._child_processes,
+            install_parent_cleanup=self._install_parent_signal_cleanup,
+            cleanup_on_error=self._stop_vllm_subprocess,
         )
-
-        log_dir = os.path.join(self.output_dir, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        self._vllm_log_path = os.path.join(log_dir, "vllm-runtime.log")
-        self._vllm_log_file = open(self._vllm_log_path, "w", buffering=1)
-        self._vllm_process = subprocess.Popen(
-            managed_process_cmd(cmd),
-            cwd=str(get_vllm_runtime_working_dir()),
-            env=os.environ.copy(),
-            stdout=self._vllm_log_file,
-            stderr=subprocess.STDOUT,
-            bufsize=1,
-            start_new_session=True,
-        )
-        self._install_parent_signal_cleanup()
-        self._vllm_port = port
-
-        timeout = float(os.environ.get("ART_DEDICATED_VLLM_TIMEOUT", 1200))
-        async with httpx.AsyncClient() as client:
-            try:
-                await wait_for_vllm_runtime(
-                    process=self._vllm_process,
-                    host=self._vllm_host,
-                    port=self._vllm_port,
-                    timeout=timeout,
-                )
-            except TimeoutError as exc:
-                self._stop_vllm_subprocess()
-                raise TimeoutError(
-                    f"vLLM subprocess did not become ready within {timeout}s. "
-                    f"Check logs at {log_dir}/vllm-runtime.log"
-                ) from exc
-            except RuntimeError as exc:
-                returncode = self._vllm_process.returncode
-                self._stop_vllm_subprocess()
-                raise RuntimeError(
-                    f"vLLM subprocess exited with code {returncode}. "
-                    f"Check logs at {log_dir}/vllm-runtime.log"
-                ) from exc
-
-            try:
-                response = await client.get(
-                    f"{self._vllm_base_url}/v1/models",
-                    **self._runtime_request_kwargs(),
-                    timeout=5.0,
-                )
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                self._stop_vllm_subprocess()
-                raise RuntimeError(
-                    "vLLM passed /health but /v1/models was not reachable. "
-                    f"Check logs at {log_dir}/vllm-runtime.log"
-                ) from exc
-        assert self._vllm_process is not None
-        assert self._vllm_log_path is not None
-        self._child_processes.watch_popen(
-            "vLLM runtime",
-            self._vllm_process,
-            log_path=self._vllm_log_path,
-        )
-        return self._vllm_host, self._vllm_port
+        self._status(f"vLLM runtime is ready at {self._vllm_base_url}")
+        return location
 
     async def _reload_adapter(self, checkpoint_path: str, step: int) -> None:
         import httpx
@@ -539,7 +642,7 @@ class MegatronService:
                 f"{self._vllm_base_url}/v1/load_lora_adapter",
                 json={
                     "lora_name": f"{self.model_name}@{step}",
-                    "lora_path": checkpoint_path,
+                    "lora_path": self._vllm_checkpoint_path(checkpoint_path),
                     "load_inplace": True,
                 },
                 **self._runtime_request_kwargs(),
@@ -605,6 +708,7 @@ class MegatronService:
         import httpx
 
         self._raise_if_child_failed()
+        self._status("Sleeping vLLM runtime to free GPU memory for training")
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/sleep",
@@ -614,11 +718,13 @@ class MegatronService:
             )
             response.raise_for_status()
         self._is_sleeping = True
+        self._status("vLLM runtime is sleeping")
 
     async def _wake_runtime(self) -> None:
         import httpx
 
         self._raise_if_child_failed()
+        self._status("Waking vLLM runtime")
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/wake_up",
@@ -627,6 +733,7 @@ class MegatronService:
             )
             response.raise_for_status()
         self._is_sleeping = False
+        self._status("vLLM runtime is awake")
 
     async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
         self._raise_if_child_failed()
@@ -643,17 +750,20 @@ class MegatronService:
             raise RuntimeError(
                 "Megatron dependencies are not available in the active ART environment. "
                 "Run `setup.sh` for this worktree and build the project venv with "
-                "`uv sync --extra backend --extra megatron` before starting Megatron "
+                "`uv sync --extra megatron` before starting Megatron "
                 "training."
             ) from exc
 
     async def _ensure_megatron_running(self) -> None:
         """Lazily start Megatron training process if not running."""
         self._raise_if_child_failed()
+        megatron_topology = self.runtime_config.topology
         if self._megatron_process is not None:
             if self._megatron_process.returncode is None:
+                assert self._active_megatron_topology == megatron_topology
                 return
             self._megatron_process = None
+            self._active_megatron_topology = None
 
         self._validate_megatron_dependencies()
 
@@ -672,8 +782,11 @@ class MegatronService:
         env["MODEL_IDENTIFIER"] = self.base_model
         if self._allow_unvalidated_arch:
             env["ART_MEGATRON_ALLOW_UNVALIDATED_ARCH"] = "1"
+        if self._model_uses_expert_replay():
+            env["ART_MEGATRON_ENABLE_MOE_ROUTING_REPLAY"] = "1"
         env["ART_MEGATRON_JOBS_DIR"] = jobs_dir
         env["ART_MEGATRON_WAKE_LOCK_PATH"] = wake_lock_path
+        env[OFFLOAD_BETWEEN_JOBS_ENV] = "0" if self.is_dedicated else "1"
         master_addr = env.get("MASTER_ADDR", "127.0.0.1")
         master_port = str(self._allocate_master_port())
         env["MASTER_ADDR"] = master_addr
@@ -681,6 +794,14 @@ class MegatronService:
         random_state = self._megatron_random_state()
         if random_state is not None:
             env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
+        lora_config = _lora_config_from_model_config(self.config)
+        if (rank := lora_config.get("rank")) is not None:
+            env[MEGATRON_LORA_RANK_ENV] = str(int(rank))
+        if target_modules := lora_config.get("target_modules"):
+            env[MEGATRON_LORA_TARGET_MODULES_ENV] = json.dumps(list(target_modules))
+        for env_name in self._megatron_topology_env_names():
+            env.pop(env_name, None)
+        env.update(self._megatron_topology_env(megatron_topology))
 
         command = [
             sys.executable,
@@ -703,6 +824,10 @@ class MegatronService:
             "w",
             buffering=1,
         )
+        self._status(
+            f"Starting Megatron worker on {num_gpus} GPU(s). "
+            f"Logs: {self._display_path(megatron_log_path)}"
+        )
         self._megatron_process = await asyncio.create_subprocess_exec(
             *managed_process_cmd(command),
             cwd=str(project_root),
@@ -717,6 +842,8 @@ class MegatronService:
             self._megatron_process,
             log_path=megatron_log_path,
         )
+        self._active_megatron_topology = megatron_topology
+        self._status("Megatron worker is initializing")
 
     def _clear_pending_jobs(self) -> None:
         jobs_dir, _training_log_dir, _wake_lock_path = self._megatron_runtime_paths()
@@ -744,28 +871,45 @@ class MegatronService:
     async def _prepare_for_training(self) -> str:
         self._raise_if_child_failed()
         self._validate_megatron_dependencies()
-        await self._ensure_megatron_running()
+        # Shared-GPU Megatron must start after vLLM has released GPU memory.
         await self._sleep_runtime()
-        gc_and_empty_cuda_cache()
+        await self._ensure_megatron_running()
 
         lora_path = self._resolve_training_lora_path()
         self._clear_pending_jobs()
         return lora_path
 
-    async def _publish_training_checkpoint(
+    def _publish_staged_training_checkpoint(
         self,
         *,
-        lora_path: str,
-    ) -> None:
-        next_step = self._latest_step + 1
-        new_checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
-        os.makedirs(new_checkpoint_dir, exist_ok=True)
-        shutil.copy(
-            f"{lora_path}/adapter_model.safetensors",
-            f"{new_checkpoint_dir}/adapter_model.safetensors",
+        staging_lora_path: str,
+        step: int,
+    ) -> str:
+        self._ensure_lora_adapter_config(staging_lora_path)
+        if not self._adapter_exists_and_loads(staging_lora_path):
+            raise RuntimeError(
+                f"Megatron training did not publish LoRA adapter: {staging_lora_path}"
+            )
+        checkpoint_dir = get_step_checkpoint_dir(self.output_dir, step)
+        if os.path.exists(checkpoint_dir):
+            raise RuntimeError(
+                f"Refusing to publish Megatron checkpoint over existing directory: "
+                f"{checkpoint_dir}"
+            )
+        self._status(
+            f"Publishing training checkpoint {step} "
+            f"to {self._display_path(checkpoint_dir)}"
         )
-        self._ensure_lora_adapter_config(new_checkpoint_dir, source_path=lora_path)
+        Path(checkpoint_dir).parent.mkdir(parents=True, exist_ok=True)
+        Path(staging_lora_path).rename(checkpoint_dir)
+        return checkpoint_dir
 
+    async def _wake_and_reload_training_checkpoint(
+        self,
+        *,
+        checkpoint_dir: str,
+        step: int,
+    ) -> None:
         _jobs_dir, _training_log_dir, wake_lock_path = self._megatron_runtime_paths()
         try:
             with open(wake_lock_path, "w") as lock_file:
@@ -775,19 +919,36 @@ class MegatronService:
             if os.path.exists(wake_lock_path):
                 os.remove(wake_lock_path)
 
-        await self._reload_adapter(new_checkpoint_dir, next_step)
+        await self._reload_adapter(checkpoint_dir, step)
+        self._status(f"Loaded checkpoint {step} into vLLM")
 
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
     ) -> tuple[str, int]:
         self._raise_if_child_failed()
         lora_path = self._resolve_active_lora_path()
+        external_runtime = get_external_vllm_runtime_config(self.config)
 
         if not self.is_dedicated and not self._sleep_mode_enabled():
             raise ValueError(
                 "Shared-GPU mode requires engine_args.enable_sleep_mode=True "
                 "for the external vLLM runtime"
             )
+
+        if external_runtime is not None:
+            if self.rollout_weights_mode != "lora":
+                raise RuntimeError(
+                    "External vLLM runtime requires LoRA rollout weights"
+                )
+            await wait_for_vllm_http_runtime(
+                base_url=self._vllm_base_url,
+                timeout=external_runtime.health_timeout_s,
+                headers=self._runtime_headers(),
+            )
+            await self._reload_adapter(lora_path, self._latest_step)
+            self._loaded_adapter_steps.add(self._latest_step)
+            self._status(f"External vLLM runtime is ready at {self._vllm_base_url}")
+            return self._vllm_host, self._vllm_port
 
         port = (config or {}).get("server_args", {}).get("port", 8000)
         location = await self._start_vllm_subprocess(lora_path, port, config)
@@ -826,7 +987,6 @@ class MegatronService:
                 lora_path = self._resolve_active_lora_path()
                 self._clear_pending_jobs()
                 next_step = self._latest_step + 1
-                new_checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
                 staging_lora_path = self._prepare_training_lora_dir(
                     lora_path,
                     next_step,
@@ -874,31 +1034,30 @@ class MegatronService:
                 async for result in stream_megatron_job(
                     job,
                     job_path=job_path,
-                    merge_output_path=new_checkpoint_dir,
                     process=self._megatron_process,
                     process_log_path=self._megatron_log_path,
                 ):
                     yield {key: float(value) for key, value in result.items()}
 
-                self._ensure_lora_adapter_config(
-                    new_checkpoint_dir, source_path=staging_lora_path
+                new_checkpoint_dir = self._publish_staged_training_checkpoint(
+                    staging_lora_path=staging_lora_path,
+                    step=next_step,
                 )
-                if not self._adapter_exists_and_loads(new_checkpoint_dir):
-                    raise RuntimeError(
-                        f"Megatron training did not publish LoRA adapter: "
-                        f"{new_checkpoint_dir}"
-                    )
                 if self.rollout_weights_mode == "merged":
                     self._latest_step = next_step
                 else:
                     await self._reload_adapter(new_checkpoint_dir, next_step)
-                shutil.rmtree(staging_lora_path, ignore_errors=True)
                 return
 
             lora_path = await self._prepare_for_training()
+            next_step = self._latest_step + 1
+            staging_lora_path = self._prepare_training_lora_dir(
+                lora_path,
+                next_step,
+            )
             job_path, log_path = self._create_megatron_job_paths()
             job = MegatronTrainingJob(
-                lora_path=lora_path,
+                lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
                 optimizer_state_path=self._get_optimizer_state_path("rl"),
                 disk_packed_tensors=disk_packed_tensors,
@@ -920,7 +1079,14 @@ class MegatronService:
             ):
                 yield {key: float(value) for key, value in result.items()}
 
-            await self._publish_training_checkpoint(lora_path=lora_path)
+            new_checkpoint_dir = self._publish_staged_training_checkpoint(
+                staging_lora_path=staging_lora_path,
+                step=next_step,
+            )
+            await self._wake_and_reload_training_checkpoint(
+                checkpoint_dir=new_checkpoint_dir,
+                step=next_step,
+            )
         except BaseException:
             await self.aclose()
             raise
@@ -938,13 +1104,18 @@ class MegatronService:
                     "train_sft is not yet supported in dedicated mode"
                 )
             lora_path = await self._prepare_for_training()
+            next_step = self._latest_step + 1
+            staging_lora_path = self._prepare_training_lora_dir(
+                lora_path,
+                next_step,
+            )
             serialized_batches = materialize_sft_batches(batches)
             job_path, log_path = self._create_megatron_job_paths()
             grad_accumulation_sequences = (
                 config.batch_size if isinstance(config.batch_size, int) else None
             )
             job = MegatronSFTTrainingJob(
-                lora_path=lora_path,
+                lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
                 optimizer_state_path=self._get_optimizer_state_path("sft"),
                 sft_data_dir=serialized_batches.sft_data_dir,
@@ -954,6 +1125,11 @@ class MegatronService:
                 log_path=log_path,
             )
             write_megatron_job(job, job_path=job_path)
+            self._status(
+                f"Starting Megatron SFT job with {serialized_batches.num_batches} "
+                f"batch(es). First batch may take a few minutes while kernels compile. "
+                f"Training log: {self._display_path(log_path)}"
+            )
 
             async for result in stream_megatron_job(
                 job,
@@ -961,13 +1137,25 @@ class MegatronService:
                 process=self._megatron_process,
                 process_log_path=self._megatron_log_path,
             ):
-                yield {
+                metrics = {
                     "loss/train": float(result["loss"]),
                     "loss/learning_rate": float(result["learning_rate"]),
                     "loss/grad_norm": float(result["grad_norm"]),
                 }
+                if "tokens_per_second" in result:
+                    metrics["throughput/step_trainer_tok_per_s"] = float(
+                        result["tokens_per_second"]
+                    )
+                yield metrics
 
-            await self._publish_training_checkpoint(lora_path=lora_path)
+            new_checkpoint_dir = self._publish_staged_training_checkpoint(
+                staging_lora_path=staging_lora_path,
+                step=next_step,
+            )
+            await self._wake_and_reload_training_checkpoint(
+                checkpoint_dir=new_checkpoint_dir,
+                step=next_step,
+            )
         except BaseException:
             await self.aclose()
             raise
@@ -976,14 +1164,7 @@ class MegatronService:
         self.close()
 
     def _stop_vllm_subprocess(self) -> None:
-        if self._vllm_process is not None:
-            terminate_popen_process_group(self._vllm_process)
-            self._vllm_process = None
-        if self._vllm_log_file is not None:
-            self._vllm_log_file.close()
-            self._vllm_log_file = None
-        self._vllm_log_path = None
-        self._vllm_nccl_so_path = None
+        self._vllm_runtime.close()
         self._merged_weight_transfer_init_info = None
         self._loaded_adapter_steps.clear()
 
@@ -993,9 +1174,11 @@ class MegatronService:
                 self._megatron_log_file.close()
                 self._megatron_log_file = None
             self._megatron_log_path = None
+            self._active_megatron_topology = None
             return
         terminate_asyncio_process_group(self._megatron_process)
         self._megatron_process = None
+        self._active_megatron_topology = None
         if self._megatron_log_file is not None:
             self._megatron_log_file.close()
             self._megatron_log_file = None

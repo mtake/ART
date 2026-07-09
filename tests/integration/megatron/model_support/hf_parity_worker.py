@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import faulthandler
 import os
 from pathlib import Path
@@ -13,7 +14,6 @@ import torch
 import torch.nn.functional as F
 
 from art.megatron import train as megatron_train
-from art.megatron.model_support import get_model_support_handler
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     RouterCallRoute,
@@ -23,12 +23,15 @@ from art.megatron.routing_replay import (
 from art.megatron.routing_replay import (
     ParallelTopology as ReplayParallelTopology,
 )
+from art.megatron.training.trace import prepare_replay_local_input_token_uids
 from art.megatron.weights.merged_weight_export import build_art_conversion_tasks
 from art.preprocessing.pack import packed_tensors_from_dir
 
+from .gdn_fp32_reference import install_megatron_qwen35_gdn_fp32_reference
 from .hf_parity import (
     HF_PARITY_REPORT_FILENAME,
     HfParityRunRequest,
+    _hf_parity_phase_pass_fns,
     build_hf_parity_report,
     build_parity_sample_indices,
     build_tensor_map_metric_rows,
@@ -36,8 +39,17 @@ from .hf_parity import (
     summarize_tensor_pair,
     zero_hf_dropout_config,
 )
-from .oracle_harness import ORACLE_TOPOLOGY, _read_json, _write_json
+from .hf_parity_canonicalization import hf_tensor_map_to_art_canonical
+from .oracle_harness import (
+    ORACLE_TOPOLOGY,
+    TEST_DEFAULT_FLEX_BACKEND,
+    _read_json,
+    _write_json,
+)
 from .oracle_worker import (
+    _apply_requested_flex_backend_patch,
+    _apply_test_attention_full_fp32_patch,
+    _apply_test_flex_inner_fp32_patch,
     _assert_runtime_configuration,
     _build_optimizer_config,
     _configure_cuda_precision,
@@ -49,7 +61,13 @@ from .test_inputs import build_sft_trajectory_tensors_from_packed_tensors
 HF_PARITY_DEBUG_ENV = "ART_HF_PARITY_DEBUG"
 _DEBUG_START_TIME = time.perf_counter()
 _VISUAL_HF_PREFIXES = ("model.visual.", "visual.")
-_HF_MOE_ROUTER_NAME_PATTERN = re.compile(r"^model\.layers\.(?P<layer>\d+)\.mlp\.gate$")
+_HF_MOE_ROUTER_NAME_PATTERN = re.compile(
+    r"^(?:"
+    r"model\.layers\.(?P<gate_layer>\d+)\.mlp\.gate|"
+    r"model(?:\.language_model)?\.layers\.(?P<mlp_router_layer>\d+)\.mlp\.router|"
+    r"model(?:\.language_model)?\.layers\.(?P<router_layer>\d+)\.router"
+    r")$"
+)
 _REPLAY_ROUTER_LAYER_PATTERN = re.compile(
     r"^chunk_\d+\.layer_(?P<layer>\d+)\.mlp\.router$"
 )
@@ -60,13 +78,44 @@ _EXPERT_WEIGHT_PATTERN = re.compile(
     r"^model(?:\.language_model)?\.layers\.(?P<layer>\d+)\.mlp\.experts\."
     r"(?P<expert>\d+)\.(?:down_proj|gate_proj|up_proj)\.weight$"
 )
+_GEMMA4_ROUTER_PROJ_WEIGHT_PATTERN = re.compile(
+    r"^(?P<prefix>model(?:\.language_model)?\.layers\.\d+\.)"
+    r"router\.proj\.weight$"
+)
+_GEMMA4_SHARED_EXPERT_WEIGHT_PATTERN = re.compile(
+    r"^(?P<prefix>model(?:\.language_model)?\.layers\.\d+\.)"
+    r"mlp\.(?:gate_proj|up_proj)\.weight$"
+)
+_GEMMA4_ABSENT_V_PROJ_WEIGHT_PATTERN = re.compile(
+    r"^(?P<prefix>model(?:\.language_model)?\.layers\.\d+\.self_attn\.)"
+    r"v_proj\.weight$"
+)
+_GEMMA4_REPARAMETERIZED_NORM_GRAD_PATTERN = re.compile(
+    r"^model(?:\.language_model)?\.layers\.\d+\.pre_feedforward_layernorm_2\.weight$"
+)
 
 
 def _hf_moe_router_key(module_name: str) -> str | None:
     match = _HF_MOE_ROUTER_NAME_PATTERN.match(module_name)
     if match is None:
         return None
-    return f"chunk_00.layer_{int(match.group('layer')):04d}.mlp.router"
+    layer = (
+        match.group("gate_layer")
+        or match.group("mlp_router_layer")
+        or match.group("router_layer")
+    )
+    return f"chunk_00.layer_{int(layer):04d}.mlp.router"
+
+
+def _hf_router_num_experts(module: Any, router_scores: torch.Tensor) -> int:
+    config = getattr(module, "config", None)
+    return int(
+        getattr(
+            module,
+            "num_experts",
+            getattr(config, "num_experts", router_scores.shape[-1]),
+        )
+    )
 
 
 class _HfMoeRoutingCapture:
@@ -160,9 +209,7 @@ class _HfMoeRoutingCapture:
                 expert_mask=torch.ones_like(
                     router_indices.detach().cpu(), dtype=torch.bool
                 ),
-                num_experts=int(
-                    getattr(module, "num_experts", router_scores.shape[-1])
-                ),
+                num_experts=_hf_router_num_experts(module, router_scores),
                 sample_index=self._active_sample_index,
                 micro_slot=(
                     None
@@ -259,23 +306,77 @@ def _install_bridge_timing_debug(provider_bundle: Any) -> None:
     model_bridge._art_hf_parity_timing_wrapped = True
 
 
+def _is_bridge_hf_load_hook(hook: Any) -> bool:
+    fn = getattr(hook, "func", hook)
+    name = getattr(fn, "__name__", "")
+    qualname = getattr(fn, "__qualname__", "")
+    return name in {
+        "load_weights_hf_to_megatron",
+        "_optimized_load_weights_hf_to_megatron",
+    } or qualname.endswith(".load_weights_hf_to_megatron")
+
+
+def _remove_bridge_hf_load_hook(provider_bundle: Any) -> None:
+    """Disable raw checkpoint load when parity seeds from HF oracle state."""
+
+    provider = provider_bundle.provider
+    hooks = list(getattr(provider, "_pre_wrap_hooks", []))
+    kept = [hook for hook in hooks if not _is_bridge_hf_load_hook(hook)]
+    if len(kept) == len(hooks):
+        raise RuntimeError(
+            "HF parity expected a Bridge HF-load pre-wrap hook to remove"
+        )
+    provider._pre_wrap_hooks = kept
+
+
+def _configure_hf_parity_provider_bundle(
+    provider_bundle: Any,
+    *,
+    use_hf_reference_state: bool,
+) -> None:
+    if use_hf_reference_state:
+        _remove_bridge_hf_load_hook(provider_bundle)
+    _install_bridge_timing_debug(provider_bundle)
+
+
 def _load_hf_model(
     *,
     base_model: str,
     num_layers: int,
     device: torch.device,
+    dtype: torch.dtype,
 ) -> Any:
     from transformers import AutoConfig, AutoModelForCausalLM
 
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(base_model)
+    ensure_hf_reference_registered = getattr(
+        handler, "ensure_hf_reference_registered", None
+    )
+    if ensure_hf_reference_registered is not None:
+        ensure_hf_reference_registered()
     config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
     set_hf_config_num_layers(config, num_layers)
     zero_hf_dropout_config(config)
+    prepare_hf_reference_config = getattr(handler, "prepare_hf_reference_config", None)
+    if prepare_hf_reference_config is not None:
+        prepare_hf_reference_config(config)
+    hf_reference_from_pretrained_kwargs = getattr(
+        handler, "hf_reference_from_pretrained_kwargs", None
+    )
+    extra_kwargs = (
+        hf_reference_from_pretrained_kwargs(config=config, dtype=dtype)
+        if hf_reference_from_pretrained_kwargs is not None
+        else {}
+    )
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
         config=config,
         trust_remote_code=True,
-        torch_dtype=torch.float32,
+        torch_dtype=dtype,
         low_cpu_mem_usage=True,
+        **extra_kwargs,
     )
     model.train()
     return cast(Any, model).to(device)
@@ -289,6 +390,37 @@ def _collect_hf_grads(model: Any) -> dict[str, torch.Tensor]:
             grad = torch.zeros_like(param)
         grads[name] = grad.detach().cpu().to(dtype=torch.float32)
     return grads
+
+
+def _collect_hf_state_dict(model: Any) -> dict[str, torch.Tensor]:
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+        if _is_language_hf_param_name(key)
+    }
+
+
+def _normalize_hf_reference_state_for_hf_parity(
+    *,
+    base_model: str,
+    model: Any,
+    state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(base_model)
+    normalize = getattr(handler, "normalize_hf_reference_state_for_hf_parity", None)
+    if normalize is not None:
+        normalize(state, config=model.config)
+    return state
+
+
+def _use_hf_reference_state_for_hf_parity(base_model: str) -> bool:
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(base_model)
+    enabled = getattr(handler, "use_hf_reference_state_for_hf_parity", None)
+    return bool(enabled()) if enabled is not None else False
 
 
 def _bridge_compatible_hf_key(key: str, expected_keys: set[str]) -> str:
@@ -406,11 +538,21 @@ def _focus_derivative_tensor_map(
     loss_active_last_layer_experts: set[int],
 ) -> dict[str, torch.Tensor]:
     focused: dict[str, torch.Tensor] = {}
+    active_router_expert_sets = {
+        layer_index: set(int(row) for row in rows.reshape(-1).tolist())
+        for layer_index, rows in active_router_rows.items()
+        if rows.numel() > 0
+    }
     for key, value in tensor_map.items():
         if match := _EXPERT_WEIGHT_PATTERN.match(key):
+            layer_index = int(match.group("layer"))
+            expert_index = int(match.group("expert"))
+            active_experts = active_router_expert_sets.get(layer_index)
+            if active_experts is not None and expert_index not in active_experts:
+                continue
             if (
-                int(match.group("layer")) == last_layer_index
-                and int(match.group("expert")) not in loss_active_last_layer_experts
+                layer_index == last_layer_index
+                and expert_index not in loss_active_last_layer_experts
             ):
                 continue
         focused_value = value
@@ -435,14 +577,23 @@ def _run_hf_sft_step(
     sample_indices: list[int | None],
     topology: ReplayParallelTopology,
     device: torch.device,
+    dtype: torch.dtype,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
     dict[str, torch.Tensor],
     MoeRoutingReplayBundle | None,
+    dict[str, torch.Tensor] | None,
 ]:
     _debug("loading HF model")
-    model = _load_hf_model(base_model=base_model, num_layers=num_layers, device=device)
+    model = _load_hf_model(
+        base_model=base_model,
+        num_layers=num_layers,
+        device=device,
+        dtype=dtype,
+    )
+    if dtype == torch.float32:
+        _install_hf_qwen35_gdn_fp32_reference(model, base_model=base_model)
     route_capture = _HfMoeRoutingCapture(model)
     _debug("running HF forward/backward")
     model.zero_grad(set_to_none=True)
@@ -472,7 +623,7 @@ def _run_hf_sft_step(
         ).logits
         shifted_labels = megatron_train.shift_tensor(labels, -100)
         per_token_loss = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]),
+            logits.float().reshape(-1, logits.shape[-1]),
             shifted_labels.reshape(-1),
             reduction="none",
             ignore_index=-100,
@@ -484,6 +635,15 @@ def _run_hf_sft_step(
         token_count += int(mask.sum().item())
         (masked_losses.sum() / total_token_count).backward()
     grads = _collect_hf_grads(model)
+    hf_reference_state_dict = (
+        _normalize_hf_reference_state_for_hf_parity(
+            base_model=base_model,
+            model=model,
+            state=_collect_hf_state_dict(model),
+        )
+        if _use_hf_reference_state_for_hf_parity(base_model)
+        else None
+    )
     routing_replay_bundle = route_capture.build_replay_bundle(topology=topology)
     scalar_loss = (loss_sum / max(token_count, 1)).detach().cpu().reshape(1)
     output_vector = torch.cat(trainable_losses, dim=0).to(dtype=torch.float32)
@@ -492,24 +652,66 @@ def _run_hf_sft_step(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     _debug("finished HF step")
-    return output_vector, scalar_loss, grads, routing_replay_bundle
+    return (
+        output_vector,
+        scalar_loss,
+        grads,
+        routing_replay_bundle,
+        hf_reference_state_dict,
+    )
+
+
+def _install_hf_qwen35_gdn_fp32_reference(model: Any, *, base_model: str) -> None:
+    model_key = base_model.lower()
+    if "qwen3.5" not in model_key and "qwen3_5" not in model_key:
+        return
+    patched = 0
+    for module in model.modules():
+        module_impl = sys.modules.get(type(module).__module__)
+        torch_impl = getattr(module_impl, "torch_chunk_gated_delta_rule", None)
+        if torch_impl is None or not hasattr(module, "chunk_gated_delta_rule"):
+            continue
+        module.chunk_gated_delta_rule = torch_impl
+        patched += 1
+    if patched == 0:
+        raise RuntimeError("Qwen3.5 HF parity found no GDN modules to patch")
 
 
 def _build_megatron_runtime(
     request: HfParityRunRequest,
+    *,
+    moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
 ) -> megatron_train.TrainingRuntime:
+    use_hf_reference_state = _use_hf_reference_state_for_hf_parity(
+        request.case_config.base_model
+    )
     return megatron_train.build_training_runtime(
         model_identifier=request.case_config.base_model,
-        provider_torch_dtype=torch.float32,
-        provider_bundle_configure=_install_bridge_timing_debug,
+        provider_torch_dtype=_dtype_for_precision(request.case_config.precision),
+        provider_bundle_configure=lambda provider_bundle: (
+            _configure_hf_parity_provider_bundle(
+                provider_bundle,
+                use_hf_reference_state=use_hf_reference_state,
+            )
+        ),
         provider_configure=lambda provider: _configure_provider(
             provider, ORACLE_TOPOLOGY, request.case_config
         ),
         optimizer_config=_build_optimizer_config(request.case_config),
+        moe_routing_replay_bundle=moe_routing_replay_bundle,
+        moe_routing_replay_strict=True,
         print_env=False,
         trainable_parameter_mode="base_model",
         allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
     )
+
+
+def _dtype_for_precision(precision: str) -> torch.dtype:
+    if precision == "bf16":
+        return torch.bfloat16
+    if precision == "fp32":
+        return torch.float32
+    raise ValueError(f"Unsupported HF parity precision: {precision}")
 
 
 def _megatron_task_tensor(
@@ -560,6 +762,53 @@ def _mapping_targets_language_only(mapping: Any) -> bool:
     return all(_is_language_hf_param_name(name) for name in names)
 
 
+def _hf_param_names_for_mapping(mapping: Any) -> set[str]:
+    names = _language_hf_param_names(mapping)
+    if not names:
+        return set()
+    return set(names)
+
+
+def _build_hf_parity_conversion_tasks(
+    *,
+    bridge: Any,
+    model: list[Any],
+    hf_keys: set[str],
+) -> list[Any]:
+    tasks = []
+    for task in build_art_conversion_tasks(bridge=bridge, model=model):
+        mapping_names = _hf_param_names_for_mapping(task.mapping)
+        if not mapping_names:
+            tasks.append(task)
+            continue
+        if mapping_names & hf_keys:
+            tasks.append(task)
+    return tasks
+
+
+def _seed_megatron_from_hf_reference_state(
+    runtime: megatron_train.TrainingRuntime,
+    *,
+    tasks: list[Any],
+    hf_reference_state_dict: dict[str, torch.Tensor],
+) -> None:
+    model_bridge = runtime.bridge._model_bridge
+    for task in tasks:
+        if task.mapping is None:
+            continue
+        hf_weights = model_bridge.maybe_modify_loaded_hf_weight(
+            task.mapping.hf_param,
+            hf_reference_state_dict,
+        )
+        converted_weights = task.mapping.hf_to_megatron(
+            hf_weights, task.megatron_module
+        )
+        if isinstance(task.param_weight, torch.nn.Parameter):
+            task.param_weight.data.copy_(converted_weights.to(task.param_weight.device))
+        elif isinstance(task.param_weight, torch.Tensor):
+            task.param_weight.copy_(converted_weights.to(task.param_weight.device))
+
+
 def _filter_language_only_tensor_map(
     tensor_map: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
@@ -570,11 +819,125 @@ def _filter_language_only_tensor_map(
     }
 
 
+def _is_gemma4_model_bridge(model_bridge: Any) -> bool:
+    return "Gemma4" in type(model_bridge).__name__
+
+
+def _add_converted_hf_grad(
+    converted: dict[str, torch.Tensor],
+    additive_keys: set[str],
+    key: str,
+    value: torch.Tensor,
+    *,
+    additive: bool = False,
+) -> None:
+    if key in converted:
+        converted[key] = converted[key] + value
+    else:
+        converted[key] = value
+    if additive:
+        additive_keys.add(key)
+
+
+def _maybe_modify_converted_hf_grad(
+    model_bridge: Any,
+    task: Any,
+    converted_weights_dict: dict[str, torch.Tensor],
+    hf_state_dict: Any,
+    *,
+    model_is_moe: bool,
+) -> tuple[dict[str, torch.Tensor], set[str]]:
+    if not _is_gemma4_model_bridge(model_bridge):
+        return (
+            model_bridge.maybe_modify_converted_hf_weight(
+                task,
+                converted_weights_dict,
+                hf_state_dict,
+            ),
+            set(),
+        )
+
+    converted: dict[str, torch.Tensor] = {}
+    additive_keys: set[str] = set()
+    for hf_name, tensor in converted_weights_dict.items():
+        if hf_name not in hf_state_dict:
+            if match := _GEMMA4_ABSENT_V_PROJ_WEIGHT_PATTERN.match(hf_name):
+                k_name = f"{match.group('prefix')}k_proj.weight"
+                hf_state_dict[k_name]
+                _add_converted_hf_grad(
+                    converted,
+                    additive_keys,
+                    k_name,
+                    tensor.float(),
+                    additive=True,
+                )
+            continue
+        grad = tensor.float()
+
+        if model_is_moe and (
+            match := _GEMMA4_ROUTER_PROJ_WEIGHT_PATTERN.match(hf_name)
+        ):
+            prefix = match.group("prefix")
+            scale = hf_state_dict[f"{prefix}router.scale"].float().to(grad.device)
+            ln2 = (
+                hf_state_dict[f"{prefix}pre_feedforward_layernorm_2.weight"]
+                .float()
+                .to(grad.device)
+            )
+            hf_weight = hf_state_dict[hf_name].float().to(grad.device)
+            root = grad.shape[-1] ** -0.5
+            factor = scale * root / ln2
+            # Gemma 4 imports fold HF preprocessing into MCore weights. Value
+            # export divides by this factor, but derivative export must apply the
+            # chain rule and accumulate the induced norm-weight gradient.
+            _add_converted_hf_grad(converted, additive_keys, hf_name, grad * factor)
+            _add_converted_hf_grad(
+                converted,
+                additive_keys,
+                f"{prefix}pre_feedforward_layernorm_2.weight",
+                (grad * hf_weight * (-scale * root / ln2.square()).unsqueeze(0)).sum(
+                    dim=0
+                ),
+                additive=True,
+            )
+            continue
+
+        if model_is_moe and (
+            match := _GEMMA4_SHARED_EXPERT_WEIGHT_PATTERN.match(hf_name)
+        ):
+            prefix = match.group("prefix")
+            pffl = (
+                hf_state_dict[f"{prefix}pre_feedforward_layernorm.weight"]
+                .float()
+                .to(grad.device)
+            )
+            ln2 = (
+                hf_state_dict[f"{prefix}pre_feedforward_layernorm_2.weight"]
+                .float()
+                .to(grad.device)
+            )
+            hf_weight = hf_state_dict[hf_name].float().to(grad.device)
+            factor = pffl / ln2
+            _add_converted_hf_grad(converted, additive_keys, hf_name, grad * factor)
+            _add_converted_hf_grad(
+                converted,
+                additive_keys,
+                f"{prefix}pre_feedforward_layernorm_2.weight",
+                (grad * hf_weight * (-pffl / ln2.square()).unsqueeze(0)).sum(dim=0),
+                additive=True,
+            )
+            continue
+
+        _add_converted_hf_grad(converted, additive_keys, hf_name, tensor)
+    return converted, additive_keys
+
+
 def _convert_megatron_tasks_to_hf(
     runtime: megatron_train.TrainingRuntime,
     *,
     mode: str,
     tasks: list[Any] | None = None,
+    hf_state_dict_override: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     if tasks is None:
         tasks = [
@@ -586,15 +949,21 @@ def _convert_megatron_tasks_to_hf(
             if isinstance(task.param_weight, torch.nn.Parameter)
         ]
     model_bridge = runtime.bridge._model_bridge
-    hf_state_dict = runtime.bridge.hf_pretrained.state
+    hf_state_dict = (
+        hf_state_dict_override
+        if hf_state_dict_override is not None
+        else runtime.bridge.hf_pretrained.state
+    )
     grouped_buffers: dict[str, dict[int, torch.Tensor]] = {}
     converted: dict[str, torch.Tensor] = {}
+    additive_grad_keys: set[str] = set()
     for task in tasks:
         tensor = _megatron_task_tensor(task, mode=mode)
         converted_weights_dict = task.mapping.megatron_to_hf(
             tensor,
             task.megatron_module,
         )
+        task_additive_grad_keys: set[str] = set()
         if getattr(task.mapping, "is_grouped_export", False):
             merged_result = model_bridge._accumulate_grouped_export(
                 task,
@@ -607,17 +976,37 @@ def _convert_megatron_tasks_to_hf(
                 continue
             converted_weights_dict = merged_result
         else:
-            converted_weights_dict = model_bridge.maybe_modify_converted_hf_weight(
-                task,
-                converted_weights_dict,
-                hf_state_dict,
-            )
+            if mode == "grad":
+                converted_weights_dict, task_additive_grad_keys = (
+                    _maybe_modify_converted_hf_grad(
+                        model_bridge,
+                        task,
+                        converted_weights_dict,
+                        hf_state_dict,
+                        model_is_moe=runtime.model_support_handler.is_moe,
+                    )
+                )
+            else:
+                converted_weights_dict = model_bridge.maybe_modify_converted_hf_weight(
+                    task,
+                    converted_weights_dict,
+                    hf_state_dict,
+                )
         for hf_name, value in converted_weights_dict.items():
             if not _is_language_hf_param_name(hf_name):
                 continue
+            value = value.detach().cpu().to(dtype=torch.float32)
             if hf_name in converted:
+                if mode == "grad" and (
+                    hf_name in additive_grad_keys or hf_name in task_additive_grad_keys
+                ):
+                    converted[hf_name] = converted[hf_name] + value
+                    additive_grad_keys.add(hf_name)
+                    continue
                 raise RuntimeError(f"Duplicate converted HF key '{hf_name}' in {mode}")
-            converted[hf_name] = value.detach().cpu().to(dtype=torch.float32)
+            converted[hf_name] = value
+            if hf_name in task_additive_grad_keys:
+                additive_grad_keys.add(hf_name)
     return converted
 
 
@@ -628,16 +1017,15 @@ def _run_megatron_sft_step(
     sample_indices: list[int | None],
     device: torch.device,
     moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
+    hf_reference_state_dict: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    runtime = _build_megatron_runtime(request)
-    _assert_runtime_configuration(runtime.model, request.case_config)
+    runtime = _build_megatron_runtime(
+        request,
+        moe_routing_replay_bundle=moe_routing_replay_bundle,
+    )
+    _assert_runtime_configuration(runtime.model, request.case_config, ORACLE_TOPOLOGY)
     assert runtime.optimizer is not None
     if moe_routing_replay_bundle is not None:
-        megatron_train.configure_moe_routing_replay(
-            runtime,
-            replay_bundle=moe_routing_replay_bundle,
-            strict=True,
-        )
         controller = runtime.moe_routing_replay_controller
         if controller is None:
             raise RuntimeError(
@@ -648,16 +1036,34 @@ def _run_megatron_sft_step(
             sample_index=sample_indices,
             global_grad_accumulation_sequences=request.case_config.grad_accumulation_sequences,
         )
-    _debug("initializing Megatron optimizer state")
-    megatron_train._eager_initialize_optimizer_state(runtime.optimizer)
-    tasks = [
-        task
-        for task in build_art_conversion_tasks(
+    if hf_reference_state_dict is None:
+        tasks = [
+            task
+            for task in build_art_conversion_tasks(
+                bridge=runtime.bridge,
+                model=runtime.model,
+            )
+            if isinstance(task.param_weight, torch.nn.Parameter)
+        ]
+    else:
+        seed_tasks = _build_hf_parity_conversion_tasks(
             bridge=runtime.bridge,
             model=runtime.model,
+            hf_keys=set(hf_reference_state_dict),
         )
-        if isinstance(task.param_weight, torch.nn.Parameter)
-    ]
+        tasks = [
+            task
+            for task in seed_tasks
+            if isinstance(task.param_weight, torch.nn.Parameter)
+        ]
+        _debug("seeding Megatron weights from HF oracle state")
+        _seed_megatron_from_hf_reference_state(
+            runtime,
+            tasks=seed_tasks,
+            hf_reference_state_dict=hf_reference_state_dict,
+        )
+    _debug("initializing Megatron optimizer state")
+    megatron_train._eager_initialize_optimizer_state(runtime.optimizer)
     _debug(f"built {len(tasks)} Megatron conversion tasks")
     for chunk in runtime.model:
         if hasattr(chunk, "zero_grad_buffer"):
@@ -673,32 +1079,40 @@ def _run_megatron_sft_step(
                 sample_indices[micro_order],
                 micro_order,
             )
-        input_ids, position_ids, shifted_labels, mask, seq_len = (
-            megatron_train._prepare_sft_micro_inputs(micro, device)
+        prepared_micro = megatron_train._prepare_dense_sft_micro(
+            micro,
+            device=device,
+            provider=runtime.provider,
+            model_support_handler=runtime.model_support_handler,
+        )
+        prepare_replay_local_input_token_uids(
+            runtime.moe_routing_replay_controller,
+            prepared_micro.local_token_uids,
+            prepared_micro.attention_state,
         )
         attention_mask = megatron_train._placeholder_attention_mask(device)
         forward_kwargs = runtime.model_support_handler.get_forward_kwargs(
             runtime.model[0],
-            attention_bias=megatron_train._causal_attention_state(seq_len, device),
+            attention_bias=prepared_micro.attention_state,
         )
         per_token_loss = runtime.model[0](
-            input_ids=input_ids,
-            position_ids=position_ids,
+            input_ids=prepared_micro.input_ids,
+            position_ids=prepared_micro.position_ids,
             attention_mask=attention_mask,
-            labels=shifted_labels,
+            labels=prepared_micro.labels,
             **forward_kwargs,
         )
-        masked_losses = per_token_loss[mask]
+        masked_losses = per_token_loss[prepared_micro.loss_mask]
         trainable_losses.append(masked_losses.detach().cpu())
         loss_sum = loss_sum + masked_losses.sum()
-        token_count += int(mask.sum().item())
+        token_count += int(prepared_micro.loss_mask.sum().item())
         masked_losses.sum().backward()
     _debug("finished Megatron forward/backward")
     num_tokens = megatron_train._local_trainable_sft_token_count_tensor(
         micro_inputs,
         device=device,
     )
-    megatron_train._flush_param_grads_to_main_grads(runtime.model)
+    megatron_train.flush_param_grads_to_main_grads(runtime.model)
     megatron_train.finalize_model_grads_extended(
         megatron_train.as_megatron_api_chunks(runtime.model),
         num_tokens=num_tokens,
@@ -715,6 +1129,7 @@ def _run_megatron_sft_step(
         runtime,
         mode="grad",
         tasks=derivative_tasks,
+        hf_state_dict_override=hf_reference_state_dict,
     )
     _debug("exported Megatron grads")
     if runtime.moe_routing_replay_controller is not None:
@@ -729,10 +1144,9 @@ def _normalize_hf_grads_for_bridge(
     hf_grads: dict[str, torch.Tensor],
     *,
     expected_grad_keys: set[str],
-    model_support_handler: Any,
 ) -> dict[str, torch.Tensor]:
     hf_grads = _filter_language_only_tensor_map(hf_grads)
-    hf_grads = model_support_handler.hf_tensor_map_to_art_canonical(
+    hf_grads = hf_tensor_map_to_art_canonical(
         hf_grads,
         expected_keys=expected_grad_keys,
     )
@@ -744,6 +1158,16 @@ def _normalize_hf_grads_for_bridge(
         key: normalized_hf_grads[key]
         for key in sorted(expected_grad_keys)
         if key in normalized_hf_grads
+    }
+
+
+def _drop_gemma4_reparameterized_norm_grads(
+    tensor_map: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    return {
+        key: value
+        for key, value in tensor_map.items()
+        if _GEMMA4_REPARAMETERIZED_NORM_GRAD_PATTERN.match(key) is None
     }
 
 
@@ -778,19 +1202,38 @@ def _worker_run(request: HfParityRunRequest) -> None:
         )
     )
     device = torch.device("cuda", 0)
+    flex_patch_stack = ExitStack()
+    flex_patch_stack.enter_context(
+        _apply_requested_flex_backend_patch(TEST_DEFAULT_FLEX_BACKEND)
+    )
+    dtype = _dtype_for_precision(request.case_config.precision)
+    if dtype == torch.float32:
+        flex_patch_stack.enter_context(
+            _apply_test_flex_inner_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
+        flex_patch_stack.enter_context(
+            _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
+        install_megatron_qwen35_gdn_fp32_reference(
+            flex_patch_stack,
+            base_model=request.case_config.base_model,
+        )
     try:
         _debug("starting HF parity worker")
-        model_support_handler = get_model_support_handler(
-            request.case_config.base_model,
-            allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
-        )
-        hf_outputs, hf_loss, hf_grads, moe_routing_replay_bundle = _run_hf_sft_step(
+        (
+            hf_outputs,
+            hf_loss,
+            hf_grads,
+            moe_routing_replay_bundle,
+            hf_reference_state_dict,
+        ) = _run_hf_sft_step(
             base_model=request.case_config.base_model,
             num_layers=request.case_config.num_layers,
             micro_inputs=micro_inputs,
             sample_indices=sample_indices,
             topology=replay_topology,
             device=device,
+            dtype=dtype,
         )
         megatron_outputs, megatron_loss, megatron_grads = _run_megatron_sft_step(
             request=request,
@@ -798,13 +1241,23 @@ def _worker_run(request: HfParityRunRequest) -> None:
             sample_indices=sample_indices,
             device=device,
             moe_routing_replay_bundle=moe_routing_replay_bundle,
+            hf_reference_state_dict=hf_reference_state_dict,
         )
         _debug("finished HF and Megatron steps, building report")
         normalized_hf_grads = _normalize_hf_grads_for_bridge(
             hf_grads,
             expected_grad_keys=set(megatron_grads.keys()),
-            model_support_handler=model_support_handler,
         )
+        if "gemma-4" in request.case_config.base_model.lower():
+            # Gemma 4 Bridge stores HF-only preprocessing parameters as buffers and
+            # folds them into Megatron weights. The fused linear gradients are
+            # compared after the chain-rule export above, but this norm's base
+            # gradient is not an independent HF-coordinate gradient in the reduced
+            # Megatron parameterization used by the shipped LoRA path.
+            normalized_hf_grads = _drop_gemma4_reparameterized_norm_grads(
+                normalized_hf_grads
+            )
+            megatron_grads = _drop_gemma4_reparameterized_norm_grads(megatron_grads)
         active_embedding_rows = _active_embedding_token_rows(micro_inputs)
         active_router_rows = _active_router_rows_by_layer(moe_routing_replay_bundle)
         last_layer_index = request.case_config.num_layers - 1
@@ -834,6 +1287,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
             phase="grads",
             reference=normalized_hf_grads,
             candidate=megatron_grads,
+            phase_pass_fns=_hf_parity_phase_pass_fns(),
         )
         report = build_hf_parity_report(
             request=request,
@@ -847,6 +1301,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
         )
         _debug("wrote HF parity report")
     finally:
+        flex_patch_stack.close()
         if torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
             torch.distributed.destroy_process_group()  # ty: ignore[possibly-missing-attribute]
 

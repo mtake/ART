@@ -15,7 +15,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--cuda-visible-devices", required=True)
-    parser.add_argument("--lora-path", required=True, help="Initial checkpoint path")
+    parser.add_argument("--lora-path", help="Optional initial checkpoint path")
     parser.add_argument("--served-model-name", required=True)
     parser.add_argument(
         "--rollout-weights-mode",
@@ -101,7 +101,9 @@ def _append_cli_arg(vllm_args: list[str], key: str, value: object) -> None:
     match value:
         case True:
             vllm_args.append(cli_key)
-        case False | None:
+        case False:
+            vllm_args.append(f"--no-{key.replace('_', '-')}")
+        case None:
             return
         case str() | int() | float():
             vllm_args.append(f"{cli_key}={value}")
@@ -137,12 +139,15 @@ def _append_cli_arg(vllm_args: list[str], key: str, value: object) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.rollout_weights_mode == "merged" and not args.lora_path:
+        raise SystemExit("--lora-path is required for merged rollout weights")
+    engine_args = json.loads(args.engine_args_json)
+    server_args = json.loads(args.server_args_json)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
     if args.rollout_weights_mode == "merged":
         os.environ["VLLM_SERVER_DEV_MODE"] = "1"
-
     apply_vllm_runtime_patches()
 
     from vllm.entrypoints.openai import api_server
@@ -151,9 +156,6 @@ def main(argv: list[str] | None = None) -> None:
         validate_parsed_serve_args,
     )
     from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-    engine_args = json.loads(args.engine_args_json)
-    server_args = json.loads(args.server_args_json)
 
     _patch_art_runtime_routes()
 
@@ -164,12 +166,11 @@ def main(argv: list[str] | None = None) -> None:
         f"--served-model-name={args.served_model_name}",
     ]
     if args.rollout_weights_mode == "lora":
-        vllm_args.extend(
-            [
-                "--enable-lora",
-                f"--lora-modules={args.served_model_name}={args.lora_path}",
-            ]
-        )
+        vllm_args.append("--enable-lora")
+        if args.lora_path:
+            vllm_args.append(
+                f"--lora-modules={args.served_model_name}={args.lora_path}"
+            )
     for extra_args in (engine_args, server_args):
         for key, value in extra_args.items():
             _append_cli_arg(vllm_args, key, value)

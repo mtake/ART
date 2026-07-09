@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from contextlib import asynccontextmanager
 import gc
 import hashlib
@@ -9,7 +11,7 @@ import shutil
 import socket
 import time
 from types import TracebackType
-from typing import AsyncIterator, Iterable, Literal, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
 logger = logging.getLogger(__name__)
@@ -22,10 +24,12 @@ import numpy as np
 import polars as pl
 import torch
 from tqdm import auto as tqdm
-from transformers import AutoImageProcessor, AutoTokenizer
-from transformers.image_processing_utils import BaseImageProcessor
+from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from transformers.image_processing_utils import BaseImageProcessor
 
 from art.utils.output_dirs import (
     get_default_art_path,
@@ -39,6 +43,10 @@ from art.utils.s3 import (
     pull_model_from_s3,
     push_model_to_s3,
 )
+from art.vllm_runtime import (
+    get_external_vllm_runtime_config,
+    openai_base_url_from_vllm_server_url,
+)
 from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
@@ -47,7 +55,7 @@ from .._backend_training import (
     build_rl_train_configs,
 )
 from ..backend import AnyTrainableModel, Backend
-from ..costs import build_cost_calculator, get_model_pricing
+from ..dev.sequence_lengths import max_seq_length_from_model_config
 from ..metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
     build_training_summary_metrics,
@@ -66,7 +74,12 @@ from ..preprocessing.tokenize import (
     tokenize_trajectory_groups,
 )
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import LocalTrainResult, Message, TrainConfig, TrainSFTConfig
+from ..types import (
+    LocalTrainResult,
+    Message,
+    TrainConfig,
+    TrainSFTConfig,
+)
 from ..utils import format_message, get_model_step
 from .adapter_leases import (
     AdapterLeaseManager,
@@ -102,6 +115,16 @@ def _configured_chat_template_server_arg(
     return chat_template_path or chat_template
 
 
+def _model_support_default_chat_template(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> str | None:
+    handler = _model_support_handler(base_model, internal_config)
+    if handler is None:
+        return None
+    return handler.default_chat_template()
+
+
 def _apply_configured_chat_template(
     tokenizer: PreTrainedTokenizerBase,
     internal_config: dev.InternalModelConfig,
@@ -111,11 +134,37 @@ def _apply_configured_chat_template(
         tokenizer.chat_template = chat_template
 
 
+def _model_support_handler(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> Any | None:
+    from ..megatron.model_support.registry import (
+        UnsupportedModelArchitectureError,
+        get_model_support_handler,
+    )
+
+    try:
+        return get_model_support_handler(
+            base_model,
+            allow_unvalidated_arch=bool(
+                internal_config.get("allow_unvalidated_arch", False)
+            ),
+        )
+    except UnsupportedModelArchitectureError:
+        return None
+
+
 def _apply_configured_chat_template_server_args(
     config_dict: dict,
     internal_config: dev.InternalModelConfig,
+    *,
+    base_model: str | None = None,
 ) -> None:
     chat_template = _configured_chat_template_server_arg(internal_config)
+    if chat_template is None and base_model is not None:
+        chat_template = _model_support_default_chat_template(
+            base_model, internal_config
+        )
     if chat_template is None:
         return
     server_args = dict(config_dict.get("server_args", {}))
@@ -147,6 +196,7 @@ class LocalBackend(Backend):
         in_process: bool = False,
         path: str | None = None,
         gpu_cost_per_hour_usd: float | None = None,
+        enable_expert_replay: bool = True,
     ) -> None:
         """
         Initializes a local, directory-based Backend interface at the given path.
@@ -162,18 +212,24 @@ class LocalBackend(Backend):
                 automatic `costs/gpu` accounting on train steps. When unset,
                 ART auto-detects supported GPU types (H200 at $3/hr today) and
                 skips GPU cost logging for unknown devices instead of guessing.
+            enable_expert_replay: For supported MoE Megatron training, capture
+                vLLM routed experts and replay them in Megatron. Defaults to True.
         """
         self._in_process = in_process
         self._path = path or get_default_art_path()
         self._gpu_cost_per_hour_usd = (
             float(gpu_cost_per_hour_usd) if gpu_cost_per_hour_usd is not None else None
         )
+        self._enable_expert_replay = enable_expert_replay
         os.makedirs(self._path, exist_ok=True)
 
         # Other initialization
         self._services: dict[str, ModelService] = {}
         self._adapter_leases: dict[str, AdapterLeaseManager] = {}
         self._tokenizers: dict[tuple[str, str | None], PreTrainedTokenizerBase] = {}
+        self._model_max_sequence_lengths: dict[
+            tuple[str, str | None, str | None], int
+        ] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
@@ -181,6 +237,48 @@ class LocalBackend(Backend):
         self._default_chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = (
             "default"
         )
+
+    def _model_uses_expert_replay(self, model: AnyTrainableModel) -> bool:
+        if not self._enable_expert_replay or not self._supports_result_packing:
+            return False
+        from ..megatron.model_support.registry import (
+            UnsupportedModelArchitectureError,
+            model_uses_expert_parallel,
+        )
+
+        allow_unvalidated_arch = bool(
+            (model._internal_config or dev.InternalModelConfig()).get(
+                "allow_unvalidated_arch", False
+            )
+        )
+        try:
+            return model_uses_expert_parallel(
+                model.base_model,
+                allow_unvalidated_arch=allow_unvalidated_arch,
+            )
+        except UnsupportedModelArchitectureError:
+            return False
+
+    def _model_max_sequence_length(self, model: AnyTrainableModel) -> int:
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        configured = internal_config.get("init_args", {}).get("max_seq_length")
+        if configured is not None:
+            return int(configured)
+        init_args = internal_config.get("init_args", {})
+        cache_key = (
+            model.base_model,
+            init_args.get("revision"),
+            init_args.get("token"),
+        )
+        if cache_key not in self._model_max_sequence_lengths:
+            self._model_max_sequence_lengths[cache_key] = (
+                max_seq_length_from_model_config(
+                    model.base_model,
+                    revision=cache_key[1],
+                    token=cache_key[2],
+                )
+            )
+        return self._model_max_sequence_lengths[cache_key]
 
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
@@ -241,6 +339,19 @@ class LocalBackend(Backend):
             "chat_template_tool_schema_format",
             self._default_chat_template_tool_schema_format,
         )
+
+    def _configure_training_tokenizer(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        *,
+        model: AnyTrainableModel,
+        internal_config: dev.InternalModelConfig,
+    ) -> PreTrainedTokenizerBase:
+        _apply_configured_chat_template(tokenizer, internal_config)
+        handler = _model_support_handler(model.base_model, internal_config)
+        if handler is None:
+            return tokenizer
+        return handler.configure_tokenizer(tokenizer, internal_config=internal_config)
 
     def __enter__(self) -> Self:
         return self
@@ -323,11 +434,6 @@ class LocalBackend(Backend):
         # (wandb initialization is now handled by the model's _get_wandb_run method)
         if model.trainable and "WANDB_API_KEY" in os.environ:
             _ = model._get_wandb_run()
-        if model.trainable:
-            trainable_model = cast(TrainableModel, model)
-            pricing = get_model_pricing(trainable_model.base_model)
-            if pricing is not None:
-                trainable_model.set_cost_calculator(build_cost_calculator(pricing))
 
     def _model_inference_name(self, model: Model, step: int | None = None) -> str:
         """Return the inference name for a model checkpoint.
@@ -385,6 +491,16 @@ class LocalBackend(Backend):
         async with pin_inference_step(model.name, step), manager.lease(step):
             yield
 
+    @asynccontextmanager
+    async def adapter_retention_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        manager = self._adapter_lease_manager(model.name)
+        async with manager.lease(step):
+            yield
+
     async def prune_model_adapters(
         self,
         model: AnyTrainableModel,
@@ -410,6 +526,7 @@ class LocalBackend(Backend):
                 base_model=model.base_model,
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
+                lora_config=model.lora_config,
             )
             validate_dedicated_config(config)
             dedicated = is_dedicated_mode(config)
@@ -455,15 +572,21 @@ class LocalBackend(Backend):
         plot_tensors: bool,
         packed_sequence_length: int | None,
         logprob_calculation_chunk_size: int,
+        include_moe_routing: bool = False,
     ) -> PackedTensors | None:
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
-            tokenizer = AutoTokenizer.from_pretrained(model.base_model)
-            _apply_configured_chat_template(tokenizer, internal_config)
+            tokenizer = self._configure_training_tokenizer(
+                AutoTokenizer.from_pretrained(model.base_model),
+                model=model,
+                internal_config=internal_config,
+            )
             self._tokenizers[tokenizer_key] = tokenizer
         if model.base_model not in self._image_processors:
             try:
+                from transformers import AutoImageProcessor
+
                 self._image_processors[model.base_model] = (
                     AutoImageProcessor.from_pretrained(model.base_model, use_fast=True)
                 )
@@ -487,9 +610,28 @@ class LocalBackend(Backend):
         )
         if not tokenized_results:
             return None
-        model_max_sequence_length = internal_config.get("init_args", {}).get(
-            "max_seq_length", 32_768
-        )
+        model_max_sequence_length = self._model_max_sequence_length(model)
+        too_long_for_model = [
+            result
+            for result in tokenized_results
+            if len(result.token_ids) > model_max_sequence_length
+        ]
+        if too_long_for_model:
+            warnings.warn(
+                "Dropping "
+                f"{len(too_long_for_model)} tokenized results from "
+                f"{len({id(result.trajectory) for result in too_long_for_model})} "
+                f"trajectories longer than model max_seq_length={model_max_sequence_length} "
+                f"(max seen {max(len(result.token_ids) for result in too_long_for_model)}).",
+                stacklevel=2,
+            )
+            tokenized_results = [
+                result
+                for result in tokenized_results
+                if len(result.token_ids) <= model_max_sequence_length
+            ]
+            if not tokenized_results:
+                return None
         if packed_sequence_length is None:
             assert not self._requires_explicit_packed_sequence_length, (
                 f"{type(self).__name__} requires packed_sequence_length to be set."
@@ -502,11 +644,6 @@ class LocalBackend(Backend):
         else:
             sequence_length = packed_sequence_length
 
-        if sequence_length > model_max_sequence_length:
-            raise ValueError(
-                f"packed_sequence_length ({sequence_length}) exceeds model max_seq_length "
-                f"({model_max_sequence_length})"
-            )
         if (
             packed_sequence_length is not None
             and self._packed_sequence_length_requires_chunk_alignment
@@ -527,7 +664,7 @@ class LocalBackend(Backend):
                 "Dropping "
                 f"{len(too_long_results)} tokenized results from "
                 f"{len({id(result.trajectory) for result in too_long_results})} "
-                f"trajectories longer than packed_sequence_length={sequence_length} "
+                f"trajectories that do not fit packed_sequence_length={sequence_length} "
                 f"(max seen {max(len(result.token_ids) for result in too_long_results)}). "
                 "This affects training, but your model may still learn.",
                 stacklevel=2,
@@ -547,6 +684,7 @@ class LocalBackend(Backend):
             truncate_long_results=False,
             advantage_balance=advantage_balance,
             pack_results=self._supports_result_packing,
+            include_moe_routing=include_moe_routing,
         )
         if (
             not allow_training_without_logprobs
@@ -603,6 +741,10 @@ class LocalBackend(Backend):
         config_dict: dict = dict(config or {})
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
         _apply_configured_chat_template_server_args(config_dict, internal_config)
+        if self._model_uses_expert_replay(model):
+            engine_args = dict(config_dict.get("engine_args", {}))
+            engine_args["enable_return_routed_experts"] = True
+            config_dict["engine_args"] = engine_args
         server_args = dict(config_dict.get("server_args", {}))
 
         # Avoid binding collisions on busy hosts when no explicit port is provided.
@@ -616,8 +758,15 @@ class LocalBackend(Backend):
         service = await self._get_service(model)
         host, port = await service.start_openai_server(config=resolved_config)
 
-        base_url = f"http://{host}:{port}/v1"
-        api_key = server_args.get("api_key") or "default"
+        external_runtime = get_external_vllm_runtime_config(internal_config)
+        if external_runtime is not None:
+            base_url = openai_base_url_from_vllm_server_url(external_runtime.server_url)
+            api_key = (
+                server_args.get("api_key") or external_runtime.api_key or "default"
+            )
+        else:
+            base_url = f"http://{host}:{port}/v1"
+            api_key = server_args.get("api_key") or "default"
 
         return base_url, api_key
 
@@ -650,6 +799,7 @@ class LocalBackend(Backend):
         kl_penalty_coef: float = 0.0,
         kl_penalty_reference_step: int | None = None,
         kl_ref_adapter_path: str | None = None,
+        kl_penalty_source: Literal["current_learner", "sample"] = "current_learner",
         epsilon: float | None = None,
         epsilon_high: float | None = None,
         # Advantage computation
@@ -705,6 +855,11 @@ class LocalBackend(Backend):
             kl_ref_adapter_path: Direct filesystem path to a LoRA adapter
                 checkpoint to use as the KL reference. Alternative to
                 kl_penalty_reference_step.
+            kl_penalty_source: Which policy's logprobs to compare against the
+                reference when building the centered KL penalty. Use
+                "current_learner" to match the original ART implementation, or
+                "sample" to shape from the rollout policy logprobs, which is
+                usually better for async/off-policy workloads.
             epsilon: Clip epsilon for importance sampling. Defaults based on loss_fn.
             epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
             advantage_balance: Balance between negative and positive advantages
@@ -755,6 +910,7 @@ class LocalBackend(Backend):
             scale_rewards = False
         if adam_params is not None:
             raise ValueError("LocalBackend requires adam_params=None.")
+        assert kl_penalty_source in {"current_learner", "sample"}
         if (
             self._requires_explicit_packed_sequence_length
             and packed_sequence_length is None
@@ -772,6 +928,15 @@ class LocalBackend(Backend):
                 get_model_dir(model=model, art_path=self._path),
                 kl_penalty_reference_step,
             )
+        elif (
+            resolved_kl_ref_adapter_path is None
+            and kl_penalty_coef > 0.0
+            and self._requires_explicit_packed_sequence_length
+        ):
+            resolved_kl_ref_adapter_path = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path),
+                0,
+            )
         config, dev_config = build_rl_train_configs(
             learning_rate=learning_rate,
             advantage_balance=advantage_balance,
@@ -785,6 +950,7 @@ class LocalBackend(Backend):
             max_negative_advantage_importance_sampling_weight=max_negative_advantage_importance_sampling_weight,
             kimi_k2_tau=kimi_k2_tau,
             kl_penalty_coef=kl_penalty_coef,
+            kl_penalty_source=kl_penalty_source,
             allow_training_without_logprobs=allow_training_without_logprobs,
             plot_tensors=plot_tensors,
             truncated_importance_sampling=truncated_importance_sampling,
@@ -850,7 +1016,7 @@ class LocalBackend(Backend):
             summary,
             include_trainable_groups=True,
         )
-
+        include_moe_routing = self._model_uses_expert_replay(model)
         packed_tensors = self._get_packed_tensors(
             model,
             trajectory_groups,
@@ -864,6 +1030,7 @@ class LocalBackend(Backend):
             logprob_calculation_chunk_size=dev_config.get(
                 "logprob_calculation_chunk_size", 1024
             ),
+            include_moe_routing=include_moe_routing,
         )
         if packed_tensors is None:
             print(
@@ -927,17 +1094,34 @@ class LocalBackend(Backend):
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
-        # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
-        grad_accumulation_sequences = max(
-            1, int(config.grad_accumulation_sequences or 1)
+        service_dev_config = cast(dev.TrainConfig, {**dev_config})
+        grad_accumulation_sequences = await self._resolve_grad_accumulation_sequences(
+            service,
+            config,
         )
+        if include_moe_routing:
+            from ..megatron.routing_replay import (
+                build_moe_routing_replay_bundle_from_packed_tensors,
+            )
+
+            routing_replay_dir = (
+                f"{get_model_dir(model=model, art_path=self._path)}/tensors/"
+                "moe_routing_replay"
+            )
+            build_moe_routing_replay_bundle_from_packed_tensors(
+                packed_tensors=packed_tensors,
+                global_grad_accumulation_sequences=grad_accumulation_sequences,
+            ).to_dir(routing_replay_dir)
+            service_dev_config["moe_routing_replay_path"] = routing_replay_dir
+            service_dev_config["moe_routing_replay_strict"] = True
+        # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
         fallback_gradient_steps = math.ceil(
             disk_packed_tensors["num_sequences"] / grad_accumulation_sequences
         )
         pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
         reported_gradient_steps: int | None = None
         async for result in service.train(
-            disk_packed_tensors, config, dev_config, verbose
+            disk_packed_tensors, config, service_dev_config, verbose
         ):
             raw_num_gradient_steps = result.pop(TRAIN_GRADIENT_STEPS_KEY, None)
             if raw_num_gradient_steps is not None:
@@ -964,6 +1148,20 @@ class LocalBackend(Backend):
         # Note: Metrics logging is now handled by the frontend (Model.train())
         if verbose:
             print("_train_model complete")
+
+    async def _resolve_grad_accumulation_sequences(
+        self,
+        service: ModelService,
+        config: TrainConfig,
+    ) -> int:
+        resolver = getattr(
+            cast(Any, service),
+            "resolve_global_grad_accumulation_sequences",
+            None,
+        )
+        if callable(resolver):
+            return max(1, int(await resolver(config)))
+        return max(1, int(config.grad_accumulation_sequences or 1))
 
     # Note: _get_reward_std_dev_learning_rate_multiplier and _log_metrics
     # have been moved to the Model class (frontend)
@@ -995,8 +1193,11 @@ class LocalBackend(Backend):
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
-            tokenizer = AutoTokenizer.from_pretrained(model.base_model)
-            _apply_configured_chat_template(tokenizer, internal_config)
+            tokenizer = self._configure_training_tokenizer(
+                AutoTokenizer.from_pretrained(model.base_model),
+                model=model,
+                internal_config=internal_config,
+            )
             self._tokenizers[tokenizer_key] = tokenizer
         tokenizer = self._tokenizers[tokenizer_key]
 
@@ -1023,10 +1224,7 @@ class LocalBackend(Backend):
             print(f"Using instruction_part: {instruction_part!r}")
             print(f"Using response_part: {response_part!r}")
 
-        max_seq_length = internal_config.get("init_args", {}).get(
-            "max_seq_length", 32_768
-        )
-        max_seq_length = int(max_seq_length) if max_seq_length is not None else None
+        max_seq_length = self._model_max_sequence_length(model)
 
         import itertools
         from typing import Iterator
